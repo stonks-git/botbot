@@ -59,6 +59,41 @@
 
 ---
 
+### SESSION 2026-02-17 (#3) - Phase 1: Memory Core
+
+**STATUS:** DONE
+
+**What was done:**
+1. Ported 4 core Python modules from intuitive-AI: config, stochastic, activation, relevance
+2. Created MemoryStore (memory.py) — full port with agent_id namespacing, Gemini embedding, hybrid search, FlashRank reranking, retrieval-induced mutation
+3. Updated api.py with 4 endpoints: POST /memory/store, POST /memory/retrieve, GET /memory/{id}, DELETE /memory/{id}
+4. Created OpenClaw memory-brain plugin (3 files) — tools (memory_recall, memory_store, memory_forget), hooks (before_agent_start auto-recall, agent_end auto-capture), service lifecycle
+5. Fixed asyncpg JSONB serialization (json.dumps for metadata) and co-access ON CONFLICT clause
+
+**Verifications PASSED:**
+- `docker compose up postgres brain` — both services healthy
+- `/health` returns 200 with memory_count and agent_count
+- `POST /memory/store` — embeds via Gemini and stores with Beta(1,4) initial weight
+- `POST /memory/retrieve` — hybrid (dense+sparse+RRF) and reranked (+ FlashRank) both work, correct ranking
+- `GET /memory/{id}` — returns full memory with depth_weight_alpha/beta
+- `DELETE /memory/{id}` — deletes, returns 404 after
+- Retrieval-induced mutation confirmed: alpha increased from 1.0 → 1.3 after 3 retrievals
+
+| File | What was done |
+|------|---------------|
+| `brain/src/config.py` | New: RetryConfig, EMBED_MODEL, EMBED_DIMENSIONS, MEMORY_TYPE_PREFIXES |
+| `brain/src/stochastic.py` | New: StochasticWeight Beta(alpha,beta) class |
+| `brain/src/activation.py` | New: ACT-R activation (B+S+P+epsilon), cosine_similarity |
+| `brain/src/relevance.py` | New: 5-component Dirichlet relevance, co-access, spread_activation |
+| `brain/src/memory.py` | New: MemoryStore — embed, store, search_similar/hybrid/reranked, mutation |
+| `brain/src/api.py` | Updated: added 4 endpoints + Pydantic models, MemoryStore in lifespan |
+| `openclaw/extensions/memory-brain/package.json` | New: plugin package metadata |
+| `openclaw/extensions/memory-brain/openclaw.plugin.json` | New: plugin manifest (kind: memory) |
+| `openclaw/extensions/memory-brain/index.ts` | New: tools + hooks + service + brain HTTP client |
+| `KB/KB_01_architecture.md` | Updated: Phase 1 section with module details, API, retrieval pipeline |
+
+---
+
 ## What is this project?
 
 BotBot bolts the intuitive-AI cognitive architecture (memory with Beta-distributed weights, gut feeling, consolidation, DMN/idle loop, safety monitoring) onto OpenClaw as a Python sidecar brain service, giving OpenClaw agents a real mind that develops identity from experience.
@@ -69,28 +104,28 @@ BotBot bolts the intuitive-AI cognitive architecture (memory with Beta-distribut
 
 | Task ID | Status |
 |---------|--------|
-| Phase 1 | NEXT — Memory Core (store + retrieve + embed + OpenClaw plugin) |
+| Phase 2 | NEXT — Entry/Exit Gate (ACT-R gate system, smart filter for what's worth remembering) |
 
 ## Blockers or open questions
 
 | Blocker/Question | Status |
 |------------------|--------|
-| GOOGLE_API_KEY needed for embeddings | Need .env setup before testing |
+| GOOGLE_API_KEY needed for embeddings | RESOLVED — key present in env, Gemini client initializes |
 
 ---
 
 ## Git Status
 
 - **Branch:** main
-- **Last commit:** 5661dec Phase 0: Brain service foundation + integration plan
-- **Modified:** KB/KB_02_intuitive_ai_reference.md (new), KB/KB_index.md, state/devlog.ndjson, state/handoff.md
+- **Last commit:** 7e6f21c KB-02: Exhaustive intuitive-AI source reference for all 13 modules
+- **Modified:** brain/src/ (5 new + 1 updated), openclaw/extensions/memory-brain/ (3 new), KB/KB_01, state/*
 
 ---
 
 ## Memory Marker
 
 ```
-MEMORY_MARKER: 2026-02-16T21:17:46+02:00 | Phase 0 Foundation complete | Phase 1 Memory Core
+MEMORY_MARKER: 2026-02-17T14:15:00+02:00 | Phase 1 Memory Core complete | Phase 2 Entry/Exit Gate next
 ```
 
 ---
@@ -100,7 +135,7 @@ MEMORY_MARKER: 2026-02-16T21:17:46+02:00 | Phase 0 Foundation complete | Phase 1
 - [x] devlog entry added for each change
 - [x] Session section filled (what was done, verifications, files touched)
 - [x] **KB updated** if code was modified + `kb_update` devlog entry
-- [x] **Blueprint updated** if scaffolding/architecture changed + `blueprint` devlog entry
+- [ ] **Blueprint updated** if scaffolding/architecture changed + `blueprint` devlog entry
 - [ ] **Decision Journal entry** if any decision was superseded + `dj_entry` devlog entry
 - [ ] `python3 taskmaster.py validate` exits 0
 - [ ] Keep only last 3 sessions (older ones archived in git)

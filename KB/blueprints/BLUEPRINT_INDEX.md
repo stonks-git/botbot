@@ -7,7 +7,7 @@
 
 | Version | Date | Summary | File |
 |---------|------|---------|------|
-| v0.1 | — | Initial scaffolding plan | `v0.1_initial_plan.md` |
+| v0.1 | 2026-02-16 | Brain integration plan — 9 phases, full cognitive architecture | `v0.1_brain_integration_plan.md` |
 
 <!--
 Append new rows on top. Update "Current" pointer. Example:
