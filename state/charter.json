@@ -1,26 +1,38 @@
 {
   "project": {
-    "name": "",
-    "one_liner": "",
-    "type": "",
-    "why": "",
-    "success_criteria": [],
-    "non_goals": [],
+    "name": "BotBot",
+    "one_liner": "Bolt intuitive-AI cognitive architecture onto OpenClaw as a Python sidecar brain service",
+    "type": "integration",
+    "why": "Give OpenClaw agents a real mind — memory with evolving weights, gut feeling, consolidation, daydreaming, safety monitoring",
+    "success_criteria": [
+      "Brain service runs as Docker sidecar alongside OpenClaw",
+      "OpenClaw agents have persistent memory with Beta-distributed weights",
+      "Gut feeling system produces emotional signals from experience",
+      "Consolidation runs background processing (insights, decay, promotion)",
+      "DMN generates spontaneous thoughts during idle time",
+      "Safety monitor prevents runaway weight escalation",
+      "Multiple agents supported via agent_id namespacing"
+    ],
+    "non_goals": [
+      "Rewriting brain in TypeScript",
+      "Modifying OpenClaw core source code",
+      "Porting the dashboard or metacognition modules"
+    ],
     "stakeholders": ["human_owner"],
-    "tag_taxonomy": ["arch", "scaffold", "decisions"],
+    "tag_taxonomy": ["arch", "scaffold", "decisions", "brain", "memory", "plugin", "docker", "schema"],
     "constraints": {
       "time": "",
       "budget": "",
       "resources": "",
-      "app_code_dir": "",
-      "infra_db": "",
-      "infra_access": "",
-      "must_use": [],
-      "must_avoid": [],
+      "app_code_dir": "brain/src",
+      "infra_db": "PostgreSQL 17 + pgvector",
+      "infra_access": "Docker Compose",
+      "must_use": ["Python 3.12", "FastAPI", "asyncpg", "gemini-embedding-001 @ 3072 dims"],
+      "must_avoid": ["modifying OpenClaw core", "LanceDB for brain storage"],
       "deploy_policy": {
-        "rule": "",
-        "steps": [],
-        "forbidden": ""
+        "rule": "Docker Compose only",
+        "steps": ["docker compose build", "docker compose up"],
+        "forbidden": "No direct production deploys without approval"
       }
     }
   },

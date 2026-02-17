@@ -1,0 +1,60 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    container_name: botbot_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: agent
+      POSTGRES_PASSWORD: ${AGENT_DB_PASSWORD:-agent_secret}
+      POSTGRES_DB: agent_memory
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1024M
+    networks:
+      - brain_net
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agent -d agent_memory"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  brain:
+    build: ./brain
+    container_name: botbot_brain
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgresql://agent:${AGENT_DB_PASSWORD:-agent_secret}@postgres:5432/agent_memory
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+    volumes:
+      - ./brain-state:/app/state:rw
+    networks:
+      - brain_net
+    ports:
+      - "8400:8400"
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2048M
+        reservations:
+          cpus: "0.5"
+          memory: 512M
+    security_opt:
+      - no-new-privileges:true
+
+networks:
+  brain_net:
+    driver: bridge
+
+volumes:
+  pgdata:

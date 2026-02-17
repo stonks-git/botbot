@@ -2,7 +2,27 @@
 
 ## Overview
 
-_(Project architecture summary goes here after bootstrap.)_
+BotBot integrates the intuitive-AI cognitive architecture into OpenClaw via a Python sidecar brain service.
+
+**Stack**: Python 3.12 (brain) + Node.js/TypeScript (OpenClaw) + PostgreSQL 17 + pgvector
+
+**Architecture**: Three Docker containers — `postgres` (pgvector), `brain` (FastAPI on :8400), `openclaw` (Node.js). Brain and OpenClaw communicate over HTTP on a shared Docker network. OpenClaw's `memory-brain` plugin hooks into the message lifecycle to inject/capture memories.
+
+**Brain subsystems** (ported from intuitive-AI with agent_id namespacing):
+- Memory store — unified table, Beta(alpha,beta) weight distributions, halfvec(3072) embeddings
+- Entry/Exit gates — ACT-R activation-based filtering
+- Identity layers — L0 (identity) + L1 (goals) as JSON files per agent
+- Gut feeling — two-centroid emotional model (subconscious vs attention)
+- Consolidation — background Tier 1 (constant) + Tier 2 (hourly deep) processing
+- DMN/Idle loop — spontaneous self-prompts with rumination threads
+- Safety monitor — hard ceilings, diminishing returns, circuit breakers
+- Bootstrap readiness — 10 milestones tracking agent maturation
+
+**Embedding model**: `gemini-embedding-001` at 3072 dimensions (max Matryoshka resolution)
+
+**Key files**: `brain/src/schema.sql` (DB schema), `brain/src/api.py` (HTTP API), `docker-compose.yml` (orchestration)
+
+See `KB/blueprints/v0.1_brain_integration_plan.md` for the full 9-phase implementation plan.
 
 ## Decision Journal
 

@@ -1,10 +1,142 @@
 {
   "meta": {
-    "status": "draft",
-    "last_updated": "",
-    "session": 0
+    "status": "active",
+    "last_updated": "2026-02-16",
+    "session": 1
   },
-  "open_questions": [],
-  "decisions": [],
-  "tasks": []
+  "open_questions": [
+    {"id": "Q-001", "question": "GOOGLE_API_KEY .env setup for embedding testing", "blocking": ["T-P1"], "status": "open"}
+  ],
+  "decisions": [
+    {
+      "id": "D-001",
+      "summary": "Python sidecar architecture: brain service (FastAPI) communicates with OpenClaw via HTTP",
+      "status": "accepted"
+    },
+    {
+      "id": "D-002",
+      "summary": "Embedding model: gemini-embedding-001 at 3072 dimensions (max Matryoshka resolution)",
+      "status": "accepted"
+    },
+    {
+      "id": "D-003",
+      "summary": "Full brain scope: memory + gut + consolidation + DMN + safety + bootstrap",
+      "status": "accepted"
+    },
+    {
+      "id": "D-004",
+      "summary": "PostgreSQL 17 + pgvector for all brain storage (replaces LanceDB)",
+      "status": "accepted"
+    }
+  ],
+  "tasks": [
+    {
+      "id": "T-P0",
+      "title": "Foundation: scaffold + schema + docker-compose",
+      "intent": "Create the project skeleton so all subsequent phases have infrastructure to build on",
+      "depends_on": [],
+      "priority": "P0",
+      "status": "done",
+      "owner": "ai",
+      "deliverable": "brain/ directory with Dockerfile, schema.sql, db.py, api.py + docker-compose.yml",
+      "acceptance_criteria": ["Dockerfile builds", "schema.sql is idempotent", "/health endpoint responds 200"],
+      "verification": ["docker compose up postgres brain", "curl localhost:8400/health"]
+    },
+    {
+      "id": "T-P1",
+      "title": "Memory Core: store + retrieve + embed + OpenClaw plugin",
+      "intent": "MVP proving end-to-end integration: store memories via brain API, retrieve them in OpenClaw context",
+      "depends_on": ["T-P0"],
+      "priority": "P0",
+      "status": "todo",
+      "owner": "ai",
+      "deliverable": "brain/src/memory.py, relevance.py, stochastic.py, activation.py + openclaw/extensions/memory-brain/",
+      "acceptance_criteria": ["Store a memory via POST /memory/store", "Retrieve via POST /memory/retrieve", "OpenClaw plugin injects memories into LLM context"],
+      "verification": ["curl POST /memory/store with test content", "curl POST /memory/retrieve with query", "Send message to OpenClaw, verify memory appears in context"]
+    },
+    {
+      "id": "T-P2",
+      "title": "Entry/Exit Gate: ACT-R gate system + scratch buffer",
+      "intent": "Replace naive auto-capture with intelligent filtering",
+      "depends_on": ["T-P1"],
+      "priority": "P1",
+      "status": "todo",
+      "owner": "ai",
+      "deliverable": "brain/src/gate.py + POST /memory/gate endpoint",
+      "acceptance_criteria": ["Entry gate stochastically filters content", "Exit gate applies 3x3 decision matrix", "Scratch buffer has 24h TTL"],
+      "verification": ["Send various content types, verify gate decisions", "Check scratch buffer expiry"]
+    },
+    {
+      "id": "T-P3",
+      "title": "Identity Layers + Context Assembly",
+      "intent": "Give agents persistent identity and structured context injection",
+      "depends_on": ["T-P1"],
+      "priority": "P1",
+      "status": "todo",
+      "owner": "ai",
+      "deliverable": "brain/src/layers.py, context_assembly.py + POST /context/assemble endpoint",
+      "acceptance_criteria": ["L0/L1 JSON files per agent_id", "Context assembly returns identity + memories + structure", "Stochastic injection varies between calls"],
+      "verification": ["Create test L0/L1, call /context/assemble", "Verify identity hash is 100-200 tokens"]
+    },
+    {
+      "id": "T-P4",
+      "title": "Gut Feeling: two-centroid emotional model",
+      "intent": "Give agents an emotional compass based on experience divergence",
+      "depends_on": ["T-P3"],
+      "priority": "P2",
+      "status": "todo",
+      "owner": "ai",
+      "deliverable": "brain/src/gut.py + POST /context/attention, GET /gut/state endpoints",
+      "acceptance_criteria": ["Two centroids compute correctly", "Emotional charge rises on divergence", "Gut summary appears in assembled context"],
+      "verification": ["Send messages on different topics, verify centroid shift", "Check gut_state endpoint"]
+    },
+    {
+      "id": "T-P5",
+      "title": "Consolidation Engine: Tier 1 + Tier 2 background processing",
+      "intent": "Background memory processing: decay, contradiction scan, pattern detection, insight generation",
+      "depends_on": ["T-P3"],
+      "priority": "P2",
+      "status": "todo",
+      "owner": "ai",
+      "deliverable": "brain/src/consolidation.py, llm.py, consolidation_runner.py + status/trigger endpoints",
+      "acceptance_criteria": ["Tier 1 runs on schedule (5/10/15 min)", "Tier 2 runs hourly or on trigger", "Insights created with memory_supersedes links"],
+      "verification": ["Store 50+ memories, wait for Tier 1", "Trigger deep consolidation, verify insights"]
+    },
+    {
+      "id": "T-P6",
+      "title": "DMN / Idle Loop: spontaneous self-prompts + rumination",
+      "intent": "Generate shower thoughts during agent idle time",
+      "depends_on": ["T-P3"],
+      "priority": "P2",
+      "status": "todo",
+      "owner": "ai",
+      "deliverable": "brain/src/idle.py, rumination.py, dmn_store.py + GET /dmn/thoughts endpoint",
+      "acceptance_criteria": ["4 sampling channels produce diverse thoughts", "Rumination threads form and persist", "OpenClaw plugin polls and surfaces thoughts"],
+      "verification": ["Leave agent idle 10+ min, poll /dmn/thoughts", "Verify channel diversity"]
+    },
+    {
+      "id": "T-P7",
+      "title": "Safety Monitor: ceilings + rate limiters + circuit breakers",
+      "intent": "Prevent runaway memory weight escalation",
+      "depends_on": ["T-P5"],
+      "priority": "P3",
+      "status": "todo",
+      "owner": "ai",
+      "deliverable": "brain/src/safety.py wired into MemoryStore",
+      "acceptance_criteria": ["Hard ceiling at 0.95", "Diminishing returns on reinforcement", "Audit log captures events"],
+      "verification": ["Reinforce memory repeatedly, verify ceiling", "Check audit log"]
+    },
+    {
+      "id": "T-P8",
+      "title": "Bootstrap Readiness: 10-milestone maturation tracking",
+      "intent": "Track new agent development from blank slate to fully mature",
+      "depends_on": ["T-P5", "T-P6"],
+      "priority": "P3",
+      "status": "todo",
+      "owner": "ai",
+      "deliverable": "brain/src/bootstrap.py + GET /bootstrap/status endpoint",
+      "acceptance_criteria": ["10 milestones with working checks", "Bootstrap prompt injected for new agents", "Milestones unlock progressively"],
+      "verification": ["New agent starts 0/10", "Store + retrieve + consolidate, verify milestones unlock"]
+    }
+  ]
 }

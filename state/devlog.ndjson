@@ -1,0 +1,6 @@
+{"ts":"2026-02-16T21:17:46+02:00","event":"decision","id":"D-001","summary":"Architecture: Python sidecar brain service + TypeScript OpenClaw plugin, PostgreSQL+pgvector, full cognitive scope"}
+{"ts":"2026-02-16T21:17:46+02:00","event":"decision","id":"D-002","summary":"Embedding model: gemini-embedding-001 at 3072 dimensions (max Matryoshka resolution) for precise gut feeling"}
+{"ts":"2026-02-16T21:17:46+02:00","event":"blueprint","id":"BP-v0.1","summary":"Brain integration plan v2 saved to KB/blueprints/v0.1_brain_integration_plan.md — 9 phases, full cognitive architecture"}
+{"ts":"2026-02-16T21:17:46+02:00","event":"feature","id":"P0","summary":"Phase 0 complete: brain/ scaffold (Dockerfile, requirements, pyproject), schema.sql (5 tables, halfvec(3072)), db.py, api.py (/health), docker-compose.yml"}
+{"ts":"2026-02-16T21:18:00+02:00","event":"kb_update","id":"KB-01","summary":"Updated KB_01_architecture.md with brain service overview, stack, subsystems, embedding model"}
+{"ts":"2026-02-16T21:18:00+02:00","event":"handoff","id":"S1","summary":"Session 1 complete: plan v2 + Phase 0 foundation. Next: Phase 1 Memory Core"}
