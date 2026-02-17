@@ -38,6 +38,27 @@
 
 ---
 
+### SESSION 2026-02-17 (#2) - intuitive-AI Source Reference KB
+
+**STATUS:** DONE
+
+**What was done:**
+1. Created KB_02_intuitive_ai_reference.md — exhaustive reference of all 13 intuitive-AI source modules
+2. Updated KB_index.md with KB-02 entry
+
+**Purpose:** Future sessions can bootstrap brain implementation from KB without reading ~6000 lines of intuitive-AI source, saving ~100k tokens of context per session.
+
+**Verifications PASSED:**
+- KB_02 covers all 13 modules with constants, signatures, SQL, LLM prompts, algorithms
+- KB_index.md updated with proper tags and load policy
+
+| File | What was done |
+|------|---------------|
+| `KB/KB_02_intuitive_ai_reference.md` | New: all 13 source modules documented |
+| `KB/KB_index.md` | Added KB-02 entry |
+
+---
+
 ## What is this project?
 
 BotBot bolts the intuitive-AI cognitive architecture (memory with Beta-distributed weights, gut feeling, consolidation, DMN/idle loop, safety monitoring) onto OpenClaw as a Python sidecar brain service, giving OpenClaw agents a real mind that develops identity from experience.
@@ -61,8 +82,8 @@ BotBot bolts the intuitive-AI cognitive architecture (memory with Beta-distribut
 ## Git Status
 
 - **Branch:** main
-- **Last commit:** d5af32b Initial scaffold: AI-DEV framework + openclaw source
-- **Modified:** brain/ (new), docker-compose.yml (new), KB/blueprints/v0.1_brain_integration_plan.md (new), state/ (updated)
+- **Last commit:** 5661dec Phase 0: Brain service foundation + integration plan
+- **Modified:** KB/KB_02_intuitive_ai_reference.md (new), KB/KB_index.md, state/devlog.ndjson, state/handoff.md
 
 ---
 
