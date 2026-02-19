@@ -7,90 +7,90 @@
 
 ## Previous Sessions
 
-### SESSION 2026-02-16 (#1) - Brain Integration Plan + Phase 0
+### SESSION 2026-02-18/19 (#5+6) - Phase 3: Context Assembly + Unified Memory Rework
 
 **STATUS:** DONE
 
 **What was done:**
-1. Explored intuitive-AI cognitive architecture (~6000 lines across 14 modules)
-2. Explored OpenClaw architecture (monorepo, plugin system, hooks, existing memory-lancedb)
-3. Made 3 architectural decisions: Python sidecar, full brain scope, PostgreSQL+pgvector
-4. Created brain integration plan v2 (9 phases, glossary, dependency graph)
-5. Completed Phase 0: Foundation (scaffold, schema, db, api, docker-compose)
-6. Updated embedding model to gemini-embedding-001 at 3072 dimensions (was 768)
+1. Initially built layers.py (L0/L1 JSON), context_assembly.py, api.py endpoints, plugin tools
+2. User feedback: identity should emerge from unified memory weights, not L0/L1 files (D-005)
+3. Created v0.2 rework blueprint documenting exhaustive modification plan
+4. Executed rework:
+   - DELETED brain/src/layers.py
+   - Rewrote context_assembly.py: removed `layers` param, added `render_identity_hash()` and `render_identity_full()` querying top-N memories by weight center from DB
+   - Rewrote api.py: removed LayerStore imports/cache/helper, added `_get_identity_embeddings()` (DB query with `embedding::float4[]` cast), removed PUT /identity endpoint + IdentityUpdateRequest model, rewired gate to use DB identity embeddings
+   - Updated plugin: removed identity_update tool + brainUpdateIdentity(), updated introspect description
 
-**Verifications PASSED:**
-- All Phase 0 files created and consistent
-- Schema uses halfvec(3072) with proper indexes
-- Docker Compose wires postgres → brain correctly
+**Verifications:**
+- Python syntax check passes for api.py, context_assembly.py
+- No LayerStore/layers.py/identity_update references in codebase (only historical comments)
+- layers.py file deleted from disk
+- Gate wiring: `_get_identity_embeddings()` queries top-N memories by weight center, passes to ExitGate
+- Empty DB: returns None → gate falls back to "peripheral" (same pre-Phase 3 behavior)
 
 | File | What was done |
 |------|---------------|
-| `KB/blueprints/v0.1_brain_integration_plan.md` | Full integration plan v2 with glossary |
-| `brain/Dockerfile` | Python 3.12 slim, uvicorn on port 8400 |
-| `brain/requirements.txt` | fastapi, asyncpg, google-genai, flashrank, numpy |
-| `brain/pyproject.toml` | Package metadata |
-| `brain/src/__init__.py` | Package init |
-| `brain/src/schema.sql` | 5 tables: memories, scratch_buffer, memory_co_access, memory_supersedes, consolidation_log |
-| `brain/src/db.py` | asyncpg pool + idempotent schema migration |
-| `brain/src/api.py` | FastAPI with /health endpoint |
-| `docker-compose.yml` | 3 services: postgres, brain, volumes + networking |
+| `brain/src/layers.py` | DELETED (D-005: unified memory) |
+| `brain/src/context_assembly.py` | Rewritten: removed layers param, added render_identity_hash/full from DB, 3-track assembly unchanged |
+| `brain/src/api.py` | Rewritten: _get_identity_embeddings from DB, removed LayerStore/PUT identity, rewired gate, version 0.2.0 |
+| `brain/src/gate.py` | Minor: updated comment (LayerStore → top-N identity memory embeddings from DB) |
+| `openclaw/extensions/memory-brain/index.ts` | Removed identity_update tool + brainUpdateIdentity(), updated header + introspect description |
+| `KB/blueprints/v0.2_unified_memory_rework.md` | New: exhaustive rework plan (created prior session) |
+| `state/roadmap.json` | T-P3 status doing → done, D-005 decision added |
 
 ---
 
-### SESSION 2026-02-17 (#2) - intuitive-AI Source Reference KB
+### SESSION 2026-02-19 (#7) - Phase 4: Gut Feeling
 
 **STATUS:** DONE
 
 **What was done:**
-1. Created KB_02_intuitive_ai_reference.md — exhaustive reference of all 13 intuitive-AI source modules
-2. Updated KB_index.md with KB-02 entry
-
-**Purpose:** Future sessions can bootstrap brain implementation from KB without reading ~6000 lines of intuitive-AI source, saving ~100k tokens of context per session.
-
-**Verifications PASSED:**
-- KB_02 covers all 13 modules with constants, signatures, SQL, LLM prompts, algorithms
-- KB_index.md updated with proper tags and load policy
+1. Created `brain/src/gut.py` with two-centroid emotional model (D-005 adapted)
+2. Wired gut into api.py (gate + context assembly + 2 new endpoints, version 0.3.0)
+3. Updated context_assembly.py + plugin (gut_check tool)
 
 | File | What was done |
 |------|---------------|
-| `KB/KB_02_intuitive_ai_reference.md` | New: all 13 source modules documented |
-| `KB/KB_index.md` | Added KB-02 entry |
+| `brain/src/gut.py` | New: GutFeeling (EMA attention, DB-weighted subconscious, GutDelta, persistence) |
+| `brain/src/api.py` | Updated: gut cache, new endpoints, gate wiring, context assembly wiring, version 0.3.0 |
+| `brain/src/context_assembly.py` | Updated: [COGNITIVE STATE] section header |
+| `openclaw/extensions/memory-brain/index.ts` | Updated: gut_check tool, brainGetGutState/brainUpdateAttention clients |
 
 ---
 
-### SESSION 2026-02-17 (#3) - Phase 1: Memory Core
+### SESSION 2026-02-19 (#8) - Phase 5: Consolidation Engine
 
 **STATUS:** DONE
 
 **What was done:**
-1. Ported 4 core Python modules from intuitive-AI: config, stochastic, activation, relevance
-2. Created MemoryStore (memory.py) — full port with agent_id namespacing, Gemini embedding, hybrid search, FlashRank reranking, retrieval-induced mutation
-3. Updated api.py with 4 endpoints: POST /memory/store, POST /memory/retrieve, GET /memory/{id}, DELETE /memory/{id}
-4. Created OpenClaw memory-brain plugin (3 files) — tools (memory_recall, memory_store, memory_forget), hooks (before_agent_start auto-recall, agent_end auto-capture), service lifecycle
-5. Fixed asyncpg JSONB serialization (json.dumps for metadata) and co-access ON CONFLICT clause
+1. Created `brain/src/llm.py` -- Anthropic Claude wrapper (claude-haiku-4-5) with retry_llm_call
+2. Created `brain/src/consolidation.py` -- full consolidation engine:
+   - ConstantConsolidation (Tier 1): _decay_tick (5min, beta+=0.01 for stale), _contradiction_scan (10min, LLM pair check, store tensions), _pattern_detection (15min, greedy cosine clustering)
+   - DeepConsolidation (Tier 2): _merge_and_insight (LLM questions+insights+narratives), _promote_patterns (D-005 direct SQL alpha updates), _decay_and_reconsolidate (beta+=1.0 for 90d stale + insight revalidation), _tune_parameters (Shannon entropy), _contextual_retrieval (WHO/WHEN/WHY preambles + re-embed)
+   - ConsolidationEngine wrapper (asyncio.gather both tiers, trigger + status)
+   - Error isolation per operation, multi-agent via SELECT DISTINCT agent_id
+3. Wired into `api.py`: background task in lifespan, GET /consolidation/status, POST /consolidation/trigger, version 0.4.0
+4. Updated plugin: consolidation_status + consolidation_trigger tools + HTTP clients
 
-**Verifications PASSED:**
-- `docker compose up postgres brain` — both services healthy
-- `/health` returns 200 with memory_count and agent_count
-- `POST /memory/store` — embeds via Gemini and stores with Beta(1,4) initial weight
-- `POST /memory/retrieve` — hybrid (dense+sparse+RRF) and reranked (+ FlashRank) both work, correct ranking
-- `GET /memory/{id}` — returns full memory with depth_weight_alpha/beta
-- `DELETE /memory/{id}` — deletes, returns 404 after
-- Retrieval-induced mutation confirmed: alpha increased from 1.0 → 1.3 after 3 retrievals
+**Verifications:**
+- Python syntax check passes for llm.py, consolidation.py, api.py
+- No LayerStore/layers.py code references (D-005)
+- No TODO/placeholder in new code
+- 9 consolidation_log writes, 2 store_insight calls (memory_supersedes linking)
 
 | File | What was done |
 |------|---------------|
-| `brain/src/config.py` | New: RetryConfig, EMBED_MODEL, EMBED_DIMENSIONS, MEMORY_TYPE_PREFIXES |
-| `brain/src/stochastic.py` | New: StochasticWeight Beta(alpha,beta) class |
-| `brain/src/activation.py` | New: ACT-R activation (B+S+P+epsilon), cosine_similarity |
-| `brain/src/relevance.py` | New: 5-component Dirichlet relevance, co-access, spread_activation |
-| `brain/src/memory.py` | New: MemoryStore — embed, store, search_similar/hybrid/reranked, mutation |
-| `brain/src/api.py` | Updated: added 4 endpoints + Pydantic models, MemoryStore in lifespan |
-| `openclaw/extensions/memory-brain/package.json` | New: plugin package metadata |
-| `openclaw/extensions/memory-brain/openclaw.plugin.json` | New: plugin manifest (kind: memory) |
-| `openclaw/extensions/memory-brain/index.ts` | New: tools + hooks + service + brain HTTP client |
-| `KB/KB_01_architecture.md` | Updated: Phase 1 section with module details, API, retrieval pipeline |
+| `brain/src/llm.py` | New: Anthropic Claude wrapper with retry |
+| `brain/src/consolidation.py` | New: Tier 1 + Tier 2 consolidation engine |
+| `brain/src/api.py` | Updated: consolidation background task, 2 new endpoints, version 0.4.0 |
+| `openclaw/extensions/memory-brain/index.ts` | Updated: consolidation_status + consolidation_trigger tools |
+
+**Post-implementation audit (5 fixes):**
+- v0.3 API Surface: added 4 missing endpoints (context/attention, gut/{agent_id}, consolidation/status, consolidation/trigger)
+- v0.3 + KB_01 dependency graph: added asyncpg to consolidation.py deps
+- consolidation_log count: corrected 10 to 9 across handoff, devlog, KB_01, v0.3
+- roadmap T-P4 deliverable: corrected `GET /gut/state` to `GET /gut/{agent_id}`
+- roadmap Q-001 status: corrected `open` to `answered`
 
 ---
 
@@ -104,29 +104,42 @@ BotBot bolts the intuitive-AI cognitive architecture (memory with Beta-distribut
 
 | Task ID | Status |
 |---------|--------|
-| Phase 2 | NEXT — Entry/Exit Gate (ACT-R gate system, smart filter for what's worth remembering) |
+| T-P6 | NEXT — DMN / Idle Loop |
+| T-P7 | AFTER — Safety Monitor |
 
 ## Blockers or open questions
 
 | Blocker/Question | Status |
 |------------------|--------|
 | GOOGLE_API_KEY needed for embeddings | RESOLVED — key present in env, Gemini client initializes |
+| halfvec deserialization from asyncpg | RESOLVED — using `embedding::float4[]` cast in SQL returns Python list, then np.array() |
 
 ---
 
 ## Git Status
 
 - **Branch:** main
-- **Last commit:** 7e6f21c KB-02: Exhaustive intuitive-AI source reference for all 13 modules
-- **Modified:** brain/src/ (5 new + 1 updated), openclaw/extensions/memory-brain/ (3 new), KB/KB_01, state/*
+- **Last commit:** 446036c Phase 1: Memory Core — store, retrieve, embed, plugin
+- **Modified (tracked):** KB/KB_01_architecture.md, KB/KB_index.md, KB/blueprints/BLUEPRINT_INDEX.md, KB/blueprints/v0.1_brain_integration_plan.md, brain/src/api.py, state/devlog.ndjson, state/handoff.md, state/roadmap.json
+- **New (untracked):** brain/src/llm.py, brain/src/consolidation.py, brain/src/context_assembly.py, brain/src/gate.py, brain/src/gut.py, KB/blueprints/v0.2_unified_memory_rework.md, KB/blueprints/v0.3_current_state.md
 
 ---
 
 ## Memory Marker
 
 ```
-MEMORY_MARKER: 2026-02-17T14:15:00+02:00 | Phase 1 Memory Core complete | Phase 2 Entry/Exit Gate next
+MEMORY_MARKER: 2026-02-19T21:30:00+02:00 | T-P5 DONE | llm.py + consolidation.py created, api.py wired, plugin updated | Next: T-P6 DMN/Idle Loop
 ```
+
+---
+
+## Next Session Bootstrap
+
+1. Read `KB/blueprints/v0.3_current_state.md` — **the single source of truth** for project state + what's next
+2. Read `KB/KB_02_intuitive_ai_reference.md` idle + rumination sections — source reference for DMN port
+3. Implement Phase 6 (DMN / Idle Loop): `brain/src/idle.py` + `brain/src/rumination.py` + `brain/src/dmn_store.py`
+4. 4 sampling channels: neglected (35%), tension (20%), temporal (20%), introspective (25%)
+5. Plugin: background poll every 30s, queue as self-prompts when idle
 
 ---
 
@@ -135,7 +148,5 @@ MEMORY_MARKER: 2026-02-17T14:15:00+02:00 | Phase 1 Memory Core complete | Phase 
 - [x] devlog entry added for each change
 - [x] Session section filled (what was done, verifications, files touched)
 - [x] **KB updated** if code was modified + `kb_update` devlog entry
-- [ ] **Blueprint updated** if scaffolding/architecture changed + `blueprint` devlog entry
-- [ ] **Decision Journal entry** if any decision was superseded + `dj_entry` devlog entry
-- [ ] `python3 taskmaster.py validate` exits 0
-- [ ] Keep only last 3 sessions (older ones archived in git)
+- [x] `python3 taskmaster.py validate` exits 0
+- [x] Keep only last 3 sessions (older ones archived in git)

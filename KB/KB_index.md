@@ -6,7 +6,7 @@
 | # | File | Description | Tags | Load |
 |---|------|-------------|------|------|
 | B | `KB/blueprints/BLUEPRINT_INDEX.md` | Version pointer + history table | arch | always |
-| B+ | `KB/blueprints/v0.1_brain_integration_plan.md` | Brain integration plan (9 phases) | arch, scaffold | always (latest only) |
+| B+ | `KB/blueprints/v0.3_current_state.md` | Current state: done phases, unified memory, next steps | arch, scaffold | always (latest only) |
 | 01 | `KB/KB_01_architecture.md` | Architecture + Decision Journal | arch, decisions | always: overview. on-demand: DJ entries by tag |
 | 02 | `KB/KB_02_intuitive_ai_reference.md` | Source reference: all 13 intuitive-AI modules | brain, memory, arch | on-demand: when implementing any brain module |
 

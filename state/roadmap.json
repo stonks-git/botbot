@@ -1,11 +1,11 @@
 {
   "meta": {
     "status": "active",
-    "last_updated": "2026-02-16",
-    "session": 1
+    "last_updated": "2026-02-19",
+    "session": 8
   },
   "open_questions": [
-    {"id": "Q-001", "question": "GOOGLE_API_KEY .env setup for embedding testing", "blocking": ["T-P1"], "status": "open"}
+    {"id": "Q-001", "question": "GOOGLE_API_KEY .env setup for embedding testing", "blocking": ["T-P1"], "status": "answered"}
   ],
   "decisions": [
     {
@@ -26,6 +26,11 @@
     {
       "id": "D-004",
       "summary": "PostgreSQL 17 + pgvector for all brain storage (replaces LanceDB)",
+      "status": "accepted"
+    },
+    {
+      "id": "D-005",
+      "summary": "Unified memory: discard L0/L1 layers, identity emerges from Beta weights in unified table. See KB/blueprints/v0.2_unified_memory_rework.md",
       "status": "accepted"
     }
   ],
@@ -48,7 +53,7 @@
       "intent": "MVP proving end-to-end integration: store memories via brain API, retrieve them in OpenClaw context",
       "depends_on": ["T-P0"],
       "priority": "P0",
-      "status": "todo",
+      "status": "done",
       "owner": "ai",
       "deliverable": "brain/src/memory.py, relevance.py, stochastic.py, activation.py + openclaw/extensions/memory-brain/",
       "acceptance_criteria": ["Store a memory via POST /memory/store", "Retrieve via POST /memory/retrieve", "OpenClaw plugin injects memories into LLM context"],
@@ -60,7 +65,7 @@
       "intent": "Replace naive auto-capture with intelligent filtering",
       "depends_on": ["T-P1"],
       "priority": "P1",
-      "status": "todo",
+      "status": "done",
       "owner": "ai",
       "deliverable": "brain/src/gate.py + POST /memory/gate endpoint",
       "acceptance_criteria": ["Entry gate stochastically filters content", "Exit gate applies 3x3 decision matrix", "Scratch buffer has 24h TTL"],
@@ -68,15 +73,16 @@
     },
     {
       "id": "T-P3",
-      "title": "Identity Layers + Context Assembly",
-      "intent": "Give agents persistent identity and structured context injection",
+      "title": "Context Assembly + Unified Identity",
+      "intent": "Give agents persistent identity (from unified memory weights) and structured context injection",
       "depends_on": ["T-P1"],
       "priority": "P1",
-      "status": "todo",
+      "status": "done",
       "owner": "ai",
-      "deliverable": "brain/src/layers.py, context_assembly.py + POST /context/assemble endpoint",
-      "acceptance_criteria": ["L0/L1 JSON files per agent_id", "Context assembly returns identity + memories + structure", "Stochastic injection varies between calls"],
-      "verification": ["Create test L0/L1, call /context/assemble", "Verify identity hash is 100-200 tokens"]
+      "deliverable": "brain/src/context_assembly.py + POST /context/assemble, GET /identity endpoints. NO layers.py (D-005: unified memory)",
+      "acceptance_criteria": ["Context assembly returns identity (from top DB memories by weight) + situational memories", "Stochastic injection varies between calls", "GATE WIRING: POST /memory/gate passes top-N memory embeddings to ExitGate.evaluate()", "No L0/L1 JSON files — identity is the weights", "GET /identity renders from top memories, not JSON files"],
+      "verification": ["Store memories, call /context/assemble — identity section populated from DB", "Verify /memory/gate exit gate classifies relevance from top-N memory embeddings", "No references to LayerStore or layers.py in codebase"],
+      "rework_plan": "KB/blueprints/v0.2_unified_memory_rework.md"
     },
     {
       "id": "T-P4",
@@ -84,11 +90,11 @@
       "intent": "Give agents an emotional compass based on experience divergence",
       "depends_on": ["T-P3"],
       "priority": "P2",
-      "status": "todo",
+      "status": "done",
       "owner": "ai",
-      "deliverable": "brain/src/gut.py + POST /context/attention, GET /gut/state endpoints",
-      "acceptance_criteria": ["Two centroids compute correctly", "Emotional charge rises on divergence", "Gut summary appears in assembled context"],
-      "verification": ["Send messages on different topics, verify centroid shift", "Check gut_state endpoint"]
+      "deliverable": "brain/src/gut.py + POST /context/attention, GET /gut/{agent_id} endpoints",
+      "acceptance_criteria": ["Two centroids compute correctly", "Emotional charge rises on divergence", "Gut summary appears in assembled context", "GATE WIRING: POST /memory/gate passes attention_embedding and emotional_charge to ExitGate.evaluate() — see gate.py:155-156. Currently None/0.0, must come from GutFeeling.attention_centroid and GutFeeling.emotional_charge"],
+      "verification": ["Send messages on different topics, verify centroid shift", "Check gut_state endpoint", "Verify /memory/gate exit gate uses emotional_charge_bonus when charge >= 0.3"]
     },
     {
       "id": "T-P5",
@@ -96,9 +102,9 @@
       "intent": "Background memory processing: decay, contradiction scan, pattern detection, insight generation",
       "depends_on": ["T-P3"],
       "priority": "P2",
-      "status": "todo",
+      "status": "done",
       "owner": "ai",
-      "deliverable": "brain/src/consolidation.py, llm.py, consolidation_runner.py + status/trigger endpoints",
+      "deliverable": "brain/src/llm.py, brain/src/consolidation.py + GET /consolidation/status, POST /consolidation/trigger endpoints",
       "acceptance_criteria": ["Tier 1 runs on schedule (5/10/15 min)", "Tier 2 runs hourly or on trigger", "Insights created with memory_supersedes links"],
       "verification": ["Store 50+ memories, wait for Tier 1", "Trigger deep consolidation, verify insights"]
     },

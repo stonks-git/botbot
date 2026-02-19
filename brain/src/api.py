@@ -1,13 +1,19 @@
 """Brain Service — FastAPI application."""
 
+import asyncio
 import logging
 import time
 from contextlib import asynccontextmanager
 
+import numpy as np
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
+from .consolidation import ConsolidationEngine
+from .context_assembly import assemble_context, render_identity_full, render_identity_hash, render_system_prompt
 from .db import close_pool, get_pool, init_pool
+from .gate import DROP, BUFFER, PERSIST, PERSIST_FLAG, PERSIST_HIGH, REINFORCE, SKIP, EntryGate, ExitGate
+from .gut import GutFeeling
 from .memory import MemoryStore
 
 logging.basicConfig(
@@ -18,29 +24,95 @@ logger = logging.getLogger("brain.api")
 
 _start_time: float = 0.0
 _memory_store: MemoryStore | None = None
+_entry_gate: EntryGate | None = None
+_exit_gate: ExitGate | None = None
+_gut_feelings: dict[str, GutFeeling] = {}
+_consolidation_engine: ConsolidationEngine | None = None
+_consolidation_shutdown: asyncio.Event | None = None
+
+
+def _get_gut(agent_id: str) -> GutFeeling:
+    """Get or load the GutFeeling instance for an agent."""
+    if agent_id not in _gut_feelings:
+        _gut_feelings[agent_id] = GutFeeling.load(agent_id)
+    return _gut_feelings[agent_id]
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup: connect DB + init MemoryStore. Shutdown: close pool."""
-    global _start_time, _memory_store
+    """Startup: connect DB + init MemoryStore + start consolidation. Shutdown: stop all."""
+    global _start_time, _memory_store, _entry_gate, _exit_gate
+    global _consolidation_engine, _consolidation_shutdown
     _start_time = time.time()
     pool = await init_pool()
     _memory_store = MemoryStore(pool)
-    logger.info("Brain service started.")
+    _entry_gate = EntryGate()
+    _exit_gate = ExitGate()
+
+    # Start consolidation engine as background task
+    _consolidation_shutdown = asyncio.Event()
+    _consolidation_engine = ConsolidationEngine(pool, _memory_store)
+    consolidation_task = asyncio.create_task(
+        _consolidation_engine.run(_consolidation_shutdown)
+    )
+    logger.info("Brain service started (consolidation engine active).")
+
     yield
+
+    # Shutdown consolidation
+    if _consolidation_shutdown:
+        _consolidation_shutdown.set()
+    consolidation_task.cancel()
+    try:
+        await consolidation_task
+    except asyncio.CancelledError:
+        pass
+
     _memory_store = None
+    _entry_gate = None
+    _exit_gate = None
+    _consolidation_engine = None
     await close_pool()
     logger.info("Brain service stopped.")
 
 
-app = FastAPI(title="Brain Service", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="Brain Service", version="0.4.0", lifespan=lifespan)
 
 
 def _store() -> MemoryStore:
     if _memory_store is None:
         raise RuntimeError("MemoryStore not initialized.")
     return _memory_store
+
+
+async def _get_identity_embeddings(agent_id: str, top_n: int = 20):
+    """Top-N memories by weight center — these ARE the agent's identity signal for the gate.
+
+    D-005: Replaces LayerStore.get_all_layer_embeddings(). Identity is the weights.
+    Returns list[(content, center, ndarray)] or None if no memories.
+    """
+    store = _store()
+    rows = await store.pool.fetch(
+        """
+        SELECT content,
+               depth_weight_alpha / (depth_weight_alpha + depth_weight_beta) AS center,
+               embedding::float4[] AS embedding_arr
+        FROM memories
+        WHERE agent_id = $1 AND embedding IS NOT NULL
+          AND depth_weight_alpha / (depth_weight_alpha + depth_weight_beta) > 0.3
+        ORDER BY depth_weight_alpha / (depth_weight_alpha + depth_weight_beta) DESC
+        LIMIT $2
+        """,
+        agent_id,
+        top_n,
+    )
+    if not rows:
+        return None
+    result = []
+    for r in rows:
+        emb = np.array(r["embedding_arr"], dtype=np.float32)
+        result.append((r["content"], r["center"], emb))
+    return result or None
 
 
 # ── Health ─────────────────────────────────────────────────────────────
@@ -106,6 +178,88 @@ class MemoryResponse(BaseModel):
 class DeleteResponse(BaseModel):
     id: str
     deleted: bool
+
+
+class GateRequest(BaseModel):
+    agent_id: str
+    content: str
+    source: str | None = None
+    source_tag: str = "external_user"
+
+
+class GateResponse(BaseModel):
+    decision: str
+    score: float
+    memory_id: str | None = None
+    scratch_id: str | None = None
+    entry_gate: dict = Field(default_factory=dict)
+    exit_gate: dict = Field(default_factory=dict)
+
+
+class ContextAssembleRequest(BaseModel):
+    agent_id: str
+    query_text: str = ""
+    conversation: list[dict] = Field(default_factory=list)
+    total_budget: int = 131_072
+
+
+class ContextAssembleResponse(BaseModel):
+    system_prompt: str
+    used_tokens: int
+    conversation_budget: int
+    identity_token_count: int
+    context_shift: float
+    inertia: float
+
+
+class IdentityResponse(BaseModel):
+    agent_id: str
+    identity: str
+
+
+class IdentityHashResponse(BaseModel):
+    agent_id: str
+    hash: str
+
+
+class AttentionUpdateRequest(BaseModel):
+    agent_id: str
+    content: str
+
+
+class AttentionUpdateResponse(BaseModel):
+    agent_id: str
+    emotional_charge: float
+    emotional_alignment: float
+    gut_summary: str
+    attention_count: int
+
+
+class GutStateResponse(BaseModel):
+    agent_id: str
+    emotional_charge: float
+    emotional_alignment: float
+    gut_summary: str
+    attention_count: int
+    has_subconscious: bool
+    has_attention: bool
+    recent_deltas: list[dict] = Field(default_factory=list)
+
+
+class ConsolidationStatusResponse(BaseModel):
+    running: bool
+    constant: dict = Field(default_factory=dict)
+    deep: dict = Field(default_factory=dict)
+
+
+class ConsolidationTriggerRequest(BaseModel):
+    agent_id: str
+
+
+class ConsolidationTriggerResponse(BaseModel):
+    agent_id: str
+    triggered: bool
+    message: str
 
 
 # ── Endpoints ──────────────────────────────────────────────────────────
@@ -210,3 +364,285 @@ async def delete_memory(
     if not deleted:
         raise HTTPException(status_code=404, detail="Memory not found")
     return DeleteResponse(id=memory_id, deleted=True)
+
+
+# ── Gate ──────────────────────────────────────────────────────────────
+
+
+@app.post("/memory/gate", response_model=GateResponse)
+async def gate_memory(req: GateRequest):
+    """Entry gate -> scratch buffer -> exit gate -> persist/reinforce/buffer/drop."""
+    store = _store()
+    if _entry_gate is None or _exit_gate is None:
+        raise HTTPException(status_code=503, detail="Gates not initialized.")
+
+    # 1. Entry gate: stochastic filter
+    should_buffer, entry_meta = _entry_gate.evaluate(
+        req.content, source=req.source or "unknown", source_tag=req.source_tag,
+    )
+    if not should_buffer:
+        return GateResponse(
+            decision=entry_meta["decision"],
+            score=0.0,
+            entry_gate=entry_meta,
+        )
+
+    # 2. Buffer to scratch
+    try:
+        scratch_id = await store.buffer_scratch(
+            req.content, req.agent_id,
+            source=req.source,
+            tags=[],
+            metadata={"source_tag": req.source_tag},
+        )
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Scratch buffer failed: {e}")
+
+    # 3. Exit gate: relevance from top-N identity memories (D-005: unified memory)
+    try:
+        layer_embeddings = await _get_identity_embeddings(req.agent_id)
+    except Exception as e:
+        logger.warning("Identity embeddings unavailable for %s: %s", req.agent_id, e)
+        layer_embeddings = None
+
+    # Phase 4: load GutFeeling, pass attention_centroid + emotional_charge
+    gut = _get_gut(req.agent_id)
+    try:
+        decision, score, exit_meta = await _exit_gate.evaluate(
+            req.content,
+            req.agent_id,
+            store,
+            layer_embeddings=layer_embeddings,
+            attention_embedding=gut.attention_centroid,
+            emotional_charge=gut.emotional_charge,
+            source_tag=req.source_tag,
+        )
+    except RuntimeError as e:
+        # Embedding failure -> keep in scratch buffer, don't lose data
+        logger.warning("Exit gate embedding failed, keeping in scratch: %s", e)
+        return GateResponse(
+            decision=BUFFER,
+            score=0.0,
+            scratch_id=scratch_id,
+            entry_gate=entry_meta,
+            exit_gate={"error": str(e)},
+        )
+
+    memory_id = None
+
+    # 4. Act on decision
+    if decision in (PERSIST, PERSIST_HIGH, PERSIST_FLAG):
+        # Promote to long-term memory
+        try:
+            importance = min(0.9, 0.5 + score * 0.4)
+            memory_id = await store.store_memory(
+                content=req.content,
+                agent_id=req.agent_id,
+                source=req.source,
+                source_tag=req.source_tag,
+                importance=importance,
+                metadata={"gate_decision": decision, "gate_score": score},
+            )
+            # Remove from scratch
+            await store.pool.execute(
+                "DELETE FROM scratch_buffer WHERE id = $1 AND agent_id = $2",
+                scratch_id, req.agent_id,
+            )
+            scratch_id = None
+        except RuntimeError as e:
+            logger.error("Failed to persist gated memory: %s", e)
+            decision = BUFFER  # Fall back to scratch
+
+    elif decision == REINFORCE:
+        # Find most similar memory and reinforce it
+        try:
+            similar = await store.search_similar(
+                req.content, req.agent_id, top_k=1, min_similarity=0.7,
+            )
+            if similar:
+                memory_id = similar[0]["id"]
+                await store.apply_retrieval_mutation(
+                    [memory_id], req.agent_id,
+                )
+            # Remove from scratch either way
+            await store.pool.execute(
+                "DELETE FROM scratch_buffer WHERE id = $1 AND agent_id = $2",
+                scratch_id, req.agent_id,
+            )
+            scratch_id = None
+        except RuntimeError as e:
+            logger.error("Failed to reinforce: %s", e)
+
+    elif decision in (DROP, SKIP):
+        # Clean up scratch
+        await store.pool.execute(
+            "DELETE FROM scratch_buffer WHERE id = $1 AND agent_id = $2",
+            scratch_id, req.agent_id,
+        )
+        scratch_id = None
+
+    # BUFFER: leave in scratch (24h TTL, consolidation may pick it up)
+
+    return GateResponse(
+        decision=decision,
+        score=score,
+        memory_id=memory_id,
+        scratch_id=scratch_id,
+        entry_gate=entry_meta,
+        exit_gate=exit_meta,
+    )
+
+
+# ── Context Assembly ─────────────────────────────────────────────────
+
+
+@app.post("/context/assemble", response_model=ContextAssembleResponse)
+async def context_assemble(req: ContextAssembleRequest):
+    """Assemble full context (identity + memories + gut) for an agent."""
+    store = _store()
+    gut = _get_gut(req.agent_id)
+
+    # Phase 4: update attention centroid from query
+    if req.query_text:
+        try:
+            query_embedding = await store.embed(
+                req.query_text, task_type="SEMANTIC_SIMILARITY"
+            )
+            gut.update_attention(query_embedding)
+        except RuntimeError as e:
+            logger.warning("Attention embedding failed for %s: %s", req.agent_id, e)
+
+    # Phase 4: update subconscious from current identity
+    try:
+        identity_embs = await _get_identity_embeddings(req.agent_id)
+        gut.update_subconscious(identity_embs)
+    except Exception as e:
+        logger.warning("Subconscious update failed for %s: %s", req.agent_id, e)
+
+    # Compute emotional delta
+    gut.compute_delta(context=req.query_text[:100] if req.query_text else "")
+
+    context = await assemble_context(
+        memory_store=store,
+        agent_id=req.agent_id,
+        attention_embedding=gut.attention_centroid,
+        previous_attention_embedding=gut.previous_attention_centroid,
+        cognitive_state_report=gut.gut_summary(),
+        query_text=req.query_text,
+        conversation=req.conversation,
+        total_budget=req.total_budget,
+    )
+    system_prompt = render_system_prompt(context)
+
+    # Persist gut state
+    try:
+        gut.save()
+    except Exception as e:
+        logger.warning("Gut state save failed for %s: %s", req.agent_id, e)
+
+    return ContextAssembleResponse(
+        system_prompt=system_prompt,
+        used_tokens=context["used_tokens"],
+        conversation_budget=context["conversation_budget"],
+        identity_token_count=context["identity_token_count"],
+        context_shift=context["context_shift"],
+        inertia=context["inertia"],
+    )
+
+
+# ── Identity ─────────────────────────────────────────────────────────
+
+
+@app.get("/identity/{agent_id}", response_model=IdentityResponse)
+async def get_identity(agent_id: str):
+    """Full identity render from top unified memories (D-005)."""
+    store = _store()
+    identity = await render_identity_full(store, agent_id)
+    return IdentityResponse(agent_id=agent_id, identity=identity)
+
+
+@app.get("/identity/{agent_id}/hash", response_model=IdentityHashResponse)
+async def get_identity_hash(agent_id: str):
+    """Compact identity hash (~100-200 tokens) from top unified memories (D-005)."""
+    store = _store()
+    hash_text = await render_identity_hash(store, agent_id)
+    return IdentityHashResponse(agent_id=agent_id, hash=hash_text)
+
+
+# ── Gut Feeling ──────────────────────────────────────────────────────
+
+
+@app.post("/context/attention", response_model=AttentionUpdateResponse)
+async def update_attention(req: AttentionUpdateRequest):
+    """Update attention centroid with new content embedding (standalone)."""
+    store = _store()
+    gut = _get_gut(req.agent_id)
+
+    try:
+        embedding = await store.embed(req.content, task_type="SEMANTIC_SIMILARITY")
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=f"Embedding failed: {e}")
+
+    gut.update_attention(embedding)
+
+    # Also refresh subconscious from current identity
+    try:
+        identity_embs = await _get_identity_embeddings(req.agent_id)
+        gut.update_subconscious(identity_embs)
+    except Exception as e:
+        logger.warning("Subconscious update failed for %s: %s", req.agent_id, e)
+
+    gut.compute_delta(context=req.content[:100])
+
+    try:
+        gut.save()
+    except Exception as e:
+        logger.warning("Gut state save failed for %s: %s", req.agent_id, e)
+
+    return AttentionUpdateResponse(
+        agent_id=req.agent_id,
+        emotional_charge=gut.emotional_charge,
+        emotional_alignment=gut.emotional_alignment,
+        gut_summary=gut.gut_summary(),
+        attention_count=gut._attention_count,
+    )
+
+
+@app.get("/gut/{agent_id}", response_model=GutStateResponse)
+async def get_gut_state(agent_id: str):
+    """Get current gut feeling state for an agent."""
+    gut = _get_gut(agent_id)
+    return GutStateResponse(
+        agent_id=agent_id,
+        emotional_charge=gut.emotional_charge,
+        emotional_alignment=gut.emotional_alignment,
+        gut_summary=gut.gut_summary(),
+        attention_count=gut._attention_count,
+        has_subconscious=gut.subconscious_centroid is not None,
+        has_attention=gut.attention_centroid is not None,
+        recent_deltas=gut._delta_log[-10:],
+    )
+
+
+# ── Consolidation ────────────────────────────────────────────────────
+
+
+@app.get("/consolidation/status", response_model=ConsolidationStatusResponse)
+async def consolidation_status():
+    """Get consolidation engine status."""
+    if _consolidation_engine is None:
+        return ConsolidationStatusResponse(running=False)
+    return ConsolidationStatusResponse(**_consolidation_engine.status())
+
+
+@app.post("/consolidation/trigger", response_model=ConsolidationTriggerResponse)
+async def consolidation_trigger(req: ConsolidationTriggerRequest):
+    """Trigger an immediate deep consolidation cycle for an agent."""
+    if _consolidation_engine is None:
+        raise HTTPException(status_code=503, detail="Consolidation engine not running.")
+    _consolidation_engine.trigger(req.agent_id)
+    return ConsolidationTriggerResponse(
+        agent_id=req.agent_id,
+        triggered=True,
+        message=f"Deep consolidation triggered for agent {req.agent_id}.",
+    )
