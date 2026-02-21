@@ -33,7 +33,8 @@ See `KB/blueprints/v0.3_current_state.md` for the current blueprint (done phases
 | ID | Tag | Decision | Supersedes | Date |
 |----|-----|----------|------------|------|
 | DJ-001 | memory | L0/L1 layers discarded for unified memory | — | 2026-02-19 |
-| DJ-002 | llm | Anthropic Haiku replaced by Gemini 2.0 Flash (Max OAuth restricted) | — | 2026-02-21 |
+| DJ-002 | llm | Anthropic Haiku replaced by Gemini 3 Flash Preview (Max OAuth restricted) | — | 2026-02-21 |
+| DJ-003 | gate | Hunger curve: dynamic gate threshold based on memory count. Newborn agents absorb everything, selectivity increases as memories accumulate. | — | 2026-02-21 |
 
 ## Phase 1: Memory Core (implemented)
 
@@ -53,7 +54,7 @@ See `KB/blueprints/v0.3_current_state.md` for the current blueprint (done phases
 **OpenClaw plugin** (`openclaw/extensions/memory-brain/`):
 - Tools: memory_recall, memory_store, memory_forget (HTTP to brain :8400)
 - Hook `before_agent_start`: auto-recall → inject via prependContext
-- Hook `agent_end`: auto-capture user messages (max 3/session, deduplicated)
+- Hook `agent_end`: auto-capture user + assistant messages with pre-gate chunking (max 10 gate calls/turn)
 - Graceful degradation: if brain unreachable, plugin logs warning, OpenClaw works without memory
 
 **Retrieval pipeline**: query → embed(RETRIEVAL_QUERY) → dense CTE (pgvector top 50) + sparse CTE (tsvector top 50) → FULL OUTER JOIN + RRF (k=60) → weighted_score = 0.5*RRF + 0.3*recency(7d halflife) + 0.2*depth_center → FlashRank rerank → final = 0.6*rerank + 0.4*weighted
@@ -124,9 +125,10 @@ api.py          ← memory, db
 - `BRAIN_URL` env or `brainUrl` config (default: `http://brain:8400`)
 - `BRAIN_AGENT_ID` env or `agentId` config (default: `"default"`)
 - `autoRecall` (default: true), `autoCapture` (default: true)
-- `recallLimit` (default: 5), `captureMaxChars` (default: 500)
+- `recallLimit` (default: 5), `captureMaxChars` (default: 500) — now target chunk size, not hard cap
 - Skip prefixes for auto-capture: `/`, `[tool:`, `[system:`, `[error:`, `` ``` ``
 - Auto-detect memory types: preference (contains "I prefer"/"I like"/"I want"), procedural ("how to"/"step"/"instructions"), episodic ("I remember"/"yesterday"/"last time"), default: semantic
+- Auto-capture scope: both user and assistant messages. Source tags: `auto_capture` (user), `self_reflection` (assistant)
 
 ## Phase 2: Entry/Exit Gate (implemented)
 
@@ -144,7 +146,8 @@ api.py          ← memory, db
   ```
 - Relevance axis: `spreading_activation(content_embedding, attention, layers)` → core (≥0.6) / peripheral (≥0.3) / irrelevant
 - Novelty axis: `check_novelty()` + `detect_contradiction_negation()` → confirming (sim≥0.85) / novel (sim<0.6) / contradicting (sim≥0.7 + negation markers)
-- Score: `base_score * (0.5 + 0.5 * s_i) + emotional_charge_bonus`
+- Score: `base_score * (0.5 + 0.5 * s_i) * hunger_boost + emotional_charge_bonus`
+- **Hunger curve** (D-009): dynamic score multiplier based on memory count. Newborn agents (0 memories) get `hunger_max_boost=2.5`, decaying exponentially (`exp(-count/10)`) toward 1.0 as memories accumulate. When hunger-boosted score ≥ 0.5 and hunger > 1.05, BUFFER is promoted to PERSIST. This solves the cold-start problem where newborn agents couldn't form memories because everything scored as peripheral×novel→buffer.
 - Noise floor: 2% chance DROP → BUFFER
 - Decision constants: PERSIST_HIGH, PERSIST_FLAG, PERSIST, REINFORCE, BUFFER, SKIP, DROP
 
@@ -164,7 +167,10 @@ Pipeline: entry gate → scratch buffer → exit gate → act on decision:
 - `agent_end` hook now calls `POST /memory/gate` instead of direct `POST /memory/store`
 - Added `brainGate()` HTTP client function
 - Gate decisions logged at debug level, gate counts at info level
-- `shouldCapture()` still does client-side pre-filtering (length, prefix) before sending to gate
+- **Captures both user AND assistant messages**: user messages gated with `source_tag="auto_capture"`, assistant messages with `source_tag="self_reflection"` — enables identity formation from agent's own output
+- **Pre-gate chunking**: `chunkText(text, captureMaxChars)` splits long messages by paragraph (`\n\n`) then sentence boundaries (`.`/`!`/`?`), greedy-merging into chunks up to `captureMaxChars` (default 500). No more hard cap that drops long messages — chunks instead.
+- **Gate call budget**: max 10 gate calls per turn across all messages (user + assistant), replacing the old `slice(0, 3)` hard limit
+- `shouldCapture()` does client-side pre-filtering (min length 10, skip mechanical prefixes) before chunking
 
 **Gate wiring** (all parameters now active):
 
@@ -173,8 +179,9 @@ Pipeline: entry gate → scratch buffer → exit gate → act on decision:
 | `layer_embeddings` | `_get_identity_embeddings()` — top-N DB memories by weight center | P3 | DONE |
 | `attention_embedding` | `GutFeeling.attention_centroid` | P4 | DONE |
 | `emotional_charge` | `GutFeeling.emotional_charge` | P4 | DONE |
+| `memory_count` | `store.memory_count(agent_id)` — hunger curve input | D-009 | DONE |
 
-**Fallback when no memories (new agent):** `subconscious_centroid=None` → `emotional_charge=0.0` → gate uses no emotional bonus. Identity embeddings return None → relevance defaults to "peripheral".
+**Fallback when no memories (new agent):** `subconscious_centroid=None` → `emotional_charge=0.0` → gate uses no emotional bonus. Identity embeddings return None → relevance defaults to "peripheral". **Hunger curve compensates**: 0 memories → 2.5x score boost → peripheral×novel still gets persisted.
 
 **Cross-module dependency graph** (Phase 1+2):
 ```
@@ -287,10 +294,10 @@ api.py               <- memory, gate, context_assembly, gut, db, numpy
 ## Phase 5: Consolidation Engine (implemented)
 
 **Brain modules:**
-- `brain/src/llm.py` -- Anthropic Claude client wrapper:
+- `brain/src/llm.py` -- Google Gemini client wrapper (D-006):
   - `retry_llm_call(prompt, max_tokens, temperature, model, retry_config)` -- async with exponential backoff retry
-  - Model: `claude-haiku-4-5` for all consolidation prompts
-  - Lazy singleton `AsyncAnthropic` client, reads `ANTHROPIC_API_KEY` from env
+  - Model: `gemini-3-flash-preview` for all consolidation/DMN prompts
+  - Uses `google-genai` SDK, reads `GOOGLE_API_KEY` from env
 
 - `brain/src/consolidation.py` -- background memory processing:
   - **Tier 1 (ConstantConsolidation)** -- 30s loop, 3 scheduled operations:
@@ -324,7 +331,7 @@ POST /consolidation/trigger
 - Tools: `consolidation_status` (view engine state), `consolidation_trigger` (trigger deep cycle)
 - HTTP clients: `brainConsolidationStatus()`, `brainTriggerConsolidation()`
 
-**Environment**: `ANTHROPIC_API_KEY` must be set in docker-compose env for brain service.
+**Environment**: `GOOGLE_API_KEY` must be set in docker-compose env for brain service (D-006).
 
 **Cross-module dependency graph** (Phase 1+2+3+4+5):
 ```
@@ -336,7 +343,7 @@ memory.py            <- config, relevance, db (pool)
 gate.py              <- activation, memory
 gut.py               <- activation (cosine_similarity), numpy, json, pathlib
 context_assembly.py  <- stochastic, activation (cosine_similarity)
-llm.py               <- config (RetryConfig), anthropic
+llm.py               <- config (RetryConfig), google-genai
 consolidation.py     <- llm, memory, activation (cosine_similarity), numpy, asyncpg (direct pool for logging)
 api.py               <- memory, gate, context_assembly, gut, consolidation, db, numpy
 ```
@@ -420,7 +427,7 @@ memory.py            <- config, relevance, db (pool); safety wired at runtime
 gate.py              <- activation, memory
 gut.py               <- activation (cosine_similarity), numpy, json, pathlib
 context_assembly.py  <- stochastic, activation (cosine_similarity)
-llm.py               <- config (RetryConfig), anthropic
+llm.py               <- config (RetryConfig), google-genai
 consolidation.py     <- llm, memory, activation, numpy, asyncpg; safety via memory.store.safety
 rumination.py        <- json, pathlib (standalone)
 dmn_store.py         <- asyncio (standalone)
@@ -462,13 +469,46 @@ memory.py            <- config, relevance, db (pool); safety wired at runtime
 gate.py              <- activation, memory
 gut.py               <- activation (cosine_similarity), numpy, json, pathlib
 context_assembly.py  <- stochastic, activation (cosine_similarity)
-llm.py               <- config (RetryConfig), anthropic
+llm.py               <- config (RetryConfig), google-genai
 consolidation.py     <- llm, memory, activation, numpy, asyncpg; safety via memory.store.safety
 rumination.py        <- json, pathlib (standalone)
 dmn_store.py         <- asyncio (standalone)
 idle.py              <- rumination, dmn_store, llm, memory, relevance (spread_activation), asyncpg
 bootstrap.py         <- asyncpg (standalone, DB-direct queries only)
 api.py               <- memory, gate, context_assembly, gut, consolidation, idle, dmn_store, safety, bootstrap, db, numpy
+```
+
+## OpenClaw Agent Runtime (implemented)
+
+**Docker service** (`docker-compose.yml`):
+- `openclaw` container: builds from `./openclaw`, depends on brain (service_healthy), port 18789
+- `GEMINI_API_KEY=${GOOGLE_API_KEY}` — same API key for agent conversations and brain
+- `OPENCLAW_STATE_DIR=/data`, volume-mounted from `./openclaw-config`
+- Gateway command: `node openclaw.mjs gateway --allow-unconfigured --bind lan --port 18789`
+- Auth: `OPENCLAW_GATEWAY_TOKEN` (default: `botbot-dev`)
+
+**Configuration** (`openclaw-config/openclaw.json`):
+- Plugin: `plugins.slots.memory: "memory-brain"` + `plugins.entries.memory-brain.config` (brainUrl, agentId=default, autoRecall, autoCapture, recallLimit=7, captureMaxChars=1000)
+- Model: `agents.defaults.model.primary: "google/gemini-3-flash-preview"` with full Google provider definition
+- Plugin discovery: memory-brain auto-discovered as "bundled" via `resolveBundledPluginsDir()` (walks up from `dist/` to find `extensions/`). Explicit `plugins.slots.memory` enables it.
+
+**Agent identity** (D-008):
+- No preset name or persona. agentId=`default`
+- Agent starts as newborn, gets BOOTSTRAP_PROMPT until all 10 milestones achieved
+- Identity emerges from memory reinforcement (high-weight memories surface as identity)
+
+**Key decisions:**
+- D-007: Agent LLM = Gemini 3 Flash Preview, reusing brain's GOOGLE_API_KEY as GEMINI_API_KEY
+- D-008: No preset identity — newborn agent discovers itself through bootstrap milestones
+
+**Full stack**:
+```
+postgres (:5433)  →  brain (:8400)  →  openclaw (:18789)
+  pgvector             FastAPI            Node.js gateway
+  memories table       19 endpoints       memory-brain plugin
+                       Gemini embed       Gemini 3 Flash (conversations)
+                       Gemini Flash       WebChat UI
+                       (consolidation)    8 tools, 2 hooks
 ```
 
 ## Decision Journal

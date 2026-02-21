@@ -143,6 +143,30 @@
       "deliverable": "brain/src/bootstrap.py + GET /bootstrap/status endpoint",
       "acceptance_criteria": ["10 milestones with working checks", "Bootstrap prompt injected for new agents", "Milestones unlock progressively"],
       "verification": ["New agent starts 0/10", "Store + retrieve + consolidate, verify milestones unlock"]
+    },
+    {
+      "id": "T-P9",
+      "title": "Replace OpenClaw default AGENTS.md with brain-aware version",
+      "intent": "Remove conflicting file-based memory instructions (SOUL.md, MEMORY.md, memory/) from the agent's system prompt. Replace with minimal AGENTS.md that orients agent toward brain-based memory. Also fix [[reply_to_current]] tag leak.",
+      "depends_on": ["T-P8"],
+      "priority": "P1",
+      "status": "todo",
+      "owner": "ai",
+      "deliverable": "Custom AGENTS.md in openclaw-config workspace, [[reply_to_current]] fix",
+      "acceptance_criteria": ["Agent system prompt has no references to SOUL.md/MEMORY.md/file-based memory", "Agent understands its memory comes from brain service", "No [[reply_to_current]] tag in agent output"],
+      "verification": ["curl /context/assemble — no SOUL.md/MEMORY.md references", "Chat via WebChat — no tag leak in responses"]
+    },
+    {
+      "id": "T-P10",
+      "title": "DMN observability: surface agent's inner monologue",
+      "intent": "Make DMN thoughts, rumination threads, and consolidation insights visible. Currently DMN output is scattered across ephemeral queues, disk files, and DB rows with no unified view. Need a way to see what the agent is 'thinking' — its self-prompts, rumination threads, tension discoveries, and pattern detections.",
+      "depends_on": ["T-P8"],
+      "priority": "P2",
+      "status": "todo",
+      "owner": "ai",
+      "deliverable": "Unified endpoint or dashboard showing DMN thoughts, active rumination threads, consolidation log entries, and tension memories",
+      "acceptance_criteria": ["Can see rumination thread content and history", "Can see DMN-generated thoughts with channel labels", "Can see consolidation insights and tension detections", "Can see what source_tag=internal_dmn memories were created"],
+      "verification": ["Leave agent idle, poll endpoint, verify thoughts appear", "Check rumination state shows thread progression"]
     }
   ]
 }

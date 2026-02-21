@@ -1,0 +1,4 @@
+.env
+brain-state/
+openclaw-config/
+__pycache__/

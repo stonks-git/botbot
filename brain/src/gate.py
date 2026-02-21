@@ -5,6 +5,7 @@ Exit gate: 3x3 decision matrix (relevance × novelty) → persist/reinforce/buff
 """
 
 import logging
+import math
 import random
 from dataclasses import dataclass, field
 
@@ -122,6 +123,8 @@ class ExitGateConfig:
     drop_noise_floor: float = 0.02
     emotional_charge_bonus: float = 0.15
     emotional_charge_threshold: float = 0.3
+    hunger_max_boost: float = 2.5
+    hunger_decay_constant: float = 10.0
 
 
 # 3x3 decision matrix: (relevance_axis, novelty_axis) -> (decision, base_score)
@@ -147,6 +150,17 @@ class ExitGate:
     def __init__(self, config: ExitGateConfig | None = None):
         self.config = config or ExitGateConfig()
 
+    def _hunger_boost(self, memory_count: int) -> float:
+        """Exponential decay from max_boost to 1.0 based on memory count.
+
+        Newborn agents (0 memories) get maximum boost so everything gets stored.
+        As memories accumulate, boost tapers to 1.0 (normal gate behavior).
+        """
+        cfg = self.config
+        return 1.0 + (cfg.hunger_max_boost - 1.0) * math.exp(
+            -memory_count / cfg.hunger_decay_constant
+        )
+
     async def evaluate(
         self,
         content: str,
@@ -156,6 +170,7 @@ class ExitGate:
         attention_embedding=None,
         emotional_charge: float = 0.0,
         source_tag: str = "external_user",
+        memory_count: int = 0,
     ) -> tuple[str, float, dict]:
         """Evaluate content through the 3x3 matrix.
 
@@ -227,13 +242,19 @@ class ExitGate:
         # 4. Matrix lookup
         decision, base_score = _DECISION_MATRIX[(relevance_axis, novelty_axis)]
 
-        # 5. Score modulation: base_score * (0.5 + 0.5 * s_i) + emotional bonus
-        score = base_score * (0.5 + 0.5 * s_i)
+        # 5. Score modulation: base_score * (0.5 + 0.5 * s_i) * hunger + emotional bonus
+        hunger = self._hunger_boost(memory_count)
+        score = base_score * (0.5 + 0.5 * s_i) * hunger
         if emotional_charge >= cfg.emotional_charge_threshold:
             score += cfg.emotional_charge_bonus
 
-        # 6. Noise floor: 2% chance DROP → BUFFER
+        # 6. Hunger promotion: buffer → persist when score is boosted above threshold
         original_decision = decision
+        if decision == BUFFER and hunger > 1.05 and score >= 0.5:
+            decision = PERSIST
+            logger.info("Hunger promotion: BUFFER → PERSIST (hunger=%.2f, score=%.3f)", hunger, score)
+
+        # 7. Noise floor: 2% chance DROP → BUFFER
         if decision == DROP and random.random() < cfg.drop_noise_floor:
             decision = BUFFER
             logger.debug("Noise floor override: DROP → BUFFER")
@@ -246,14 +267,16 @@ class ExitGate:
             "contradiction_score": round(contradiction_score, 4),
             "base_score": base_score,
             "emotional_charge": round(emotional_charge, 4),
+            "hunger_boost": round(hunger, 4),
+            "memory_count": memory_count,
             "matrix_decision": original_decision,
             "final_decision": decision,
             "score": round(score, 4),
         }
 
         logger.info(
-            "Exit gate [%s]: %s×%s → %s (score=%.3f, s_i=%.3f, sim=%.3f)",
-            agent_id, relevance_axis, novelty_axis, decision, score, s_i, max_similarity,
+            "Exit gate [%s]: %s×%s → %s (score=%.3f, s_i=%.3f, sim=%.3f, hunger=%.2f, memories=%d)",
+            agent_id, relevance_axis, novelty_axis, decision, score, s_i, max_similarity, hunger, memory_count,
         )
 
         return decision, score, metadata

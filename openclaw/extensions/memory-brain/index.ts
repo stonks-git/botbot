@@ -434,15 +434,66 @@ function formatMemoriesContext(
   ].join("\n");
 }
 
-function shouldCapture(text: string, maxChars: number): boolean {
+function shouldCapture(text: string): boolean {
   if (!text || text.length < 10) return false;
-  if (text.length > maxChars) return false;
   // Skip mechanical/command content
   const skipPrefixes = ["/", "[tool:", "[system:", "[error:", "```"];
   for (const p of skipPrefixes) {
     if (text.startsWith(p)) return false;
   }
   return true;
+}
+
+/** Split long text into chunks of ~maxChars by paragraph then sentence boundaries. */
+function chunkText(text: string, maxChars: number): string[] {
+  if (text.length <= maxChars) return [text];
+
+  const chunks: string[] = [];
+  // Split by paragraph boundaries first
+  const paragraphs = text.split(/\n\n+/);
+
+  let current = "";
+  for (const para of paragraphs) {
+    // Paragraph fits in current chunk
+    if (current.length + para.length + 2 <= maxChars) {
+      current = current ? current + "\n\n" + para : para;
+      continue;
+    }
+
+    // Flush current chunk if non-empty
+    if (current) {
+      chunks.push(current.trim());
+      current = "";
+    }
+
+    // Paragraph itself fits as one chunk
+    if (para.length <= maxChars) {
+      current = para;
+      continue;
+    }
+
+    // Paragraph too long — split by sentence boundaries
+    const sentences = para.split(/(?<=[.!?])\s+/);
+    for (const sentence of sentences) {
+      if (current.length + sentence.length + 1 <= maxChars) {
+        current = current ? current + " " + sentence : sentence;
+      } else {
+        if (current) chunks.push(current.trim());
+        // Sentence itself too long — hard split as last resort
+        if (sentence.length > maxChars) {
+          for (let i = 0; i < sentence.length; i += maxChars) {
+            chunks.push(sentence.slice(i, i + maxChars));
+          }
+          current = "";
+        } else {
+          current = sentence;
+        }
+      }
+    }
+  }
+  if (current.trim()) chunks.push(current.trim());
+
+  return chunks.filter((c) => c.length >= 10);
 }
 
 function detectType(text: string): string {
@@ -999,22 +1050,26 @@ const memoryBrainPlugin = {
       });
     }
 
-    // Auto-capture: store user messages after successful agent turn
+    // Auto-capture: gate user + assistant messages after successful agent turn
     if (cfg.autoCapture) {
       api.on("agent_end", async (event) => {
         if (!event.success || !event.messages || event.messages.length === 0)
           return;
 
         try {
-          const texts: string[] = [];
+          const captured: { text: string; sourceTag: string }[] = [];
           for (const msg of event.messages) {
             if (!msg || typeof msg !== "object") continue;
             const msgObj = msg as Record<string, unknown>;
-            if (msgObj.role !== "user") continue;
+            const role = msgObj.role;
+            if (role !== "user" && role !== "assistant") continue;
+
+            const sourceTag =
+              role === "assistant" ? "self_reflection" : "auto_capture";
 
             const content = msgObj.content;
             if (typeof content === "string") {
-              texts.push(content);
+              captured.push({ text: content, sourceTag });
               continue;
             }
             if (Array.isArray(content)) {
@@ -1027,38 +1082,54 @@ const memoryBrainPlugin = {
                   "text" in block &&
                   typeof (block as Record<string, unknown>).text === "string"
                 ) {
-                  texts.push(
-                    (block as Record<string, unknown>).text as string,
-                  );
+                  captured.push({
+                    text: (block as Record<string, unknown>).text as string,
+                    sourceTag,
+                  });
                 }
               }
             }
           }
 
-          const toCapture = texts.filter((t) =>
-            shouldCapture(t, cfg.captureMaxChars),
-          );
-          if (toCapture.length === 0) return;
+          // Filter, chunk, and flatten into gate-ready items
+          const MAX_GATE_CALLS = 10;
+          const gateItems: { chunk: string; sourceTag: string }[] = [];
+          for (const item of captured) {
+            if (!shouldCapture(item.text)) continue;
+            const chunks = chunkText(item.text, cfg.captureMaxChars);
+            for (const chunk of chunks) {
+              if (gateItems.length >= MAX_GATE_CALLS) break;
+              gateItems.push({ chunk, sourceTag: item.sourceTag });
+            }
+            if (gateItems.length >= MAX_GATE_CALLS) break;
+          }
+          if (gateItems.length === 0) return;
 
           let gated = 0;
-          for (const text of toCapture.slice(0, 3)) {
+          for (const item of gateItems) {
             const result = await brainGate(
               cfg.brainUrl,
               cfg.agentId,
-              text,
+              item.chunk,
               null,
-              "auto_capture",
+              item.sourceTag,
             );
             if (result) {
               gated++;
               api.logger.debug?.(
-                `memory-brain: gate decision=${result.decision} score=${result.score.toFixed(3)}`,
+                `memory-brain: gate [${item.sourceTag}] decision=${result.decision} score=${result.score.toFixed(3)}`,
               );
             }
           }
 
           if (gated > 0) {
-            api.logger.info?.(`memory-brain: gated ${gated} messages through brain`);
+            const userChunks = gateItems.filter(
+              (i) => i.sourceTag === "auto_capture",
+            ).length;
+            const selfChunks = gateItems.length - userChunks;
+            api.logger.info?.(
+              `memory-brain: gated ${gated}/${gateItems.length} chunks (${userChunks} user, ${selfChunks} self)`,
+            );
           }
         } catch (err) {
           api.logger.warn?.(

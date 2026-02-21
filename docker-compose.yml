@@ -50,6 +50,50 @@ services:
           memory: 512M
     security_opt:
       - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8400/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  openclaw:
+    build: ./openclaw
+    container_name: botbot_openclaw
+    restart: unless-stopped
+    depends_on:
+      brain:
+        condition: service_healthy
+    environment:
+      - HOME=/home/node
+      - GEMINI_API_KEY=${GOOGLE_API_KEY}
+      - OPENCLAW_STATE_DIR=/data
+      - OPENCLAW_GATEWAY_TOKEN=${OPENCLAW_GATEWAY_TOKEN:-botbot-dev}
+    volumes:
+      - ./openclaw-config:/data
+      - ./openclaw-workspace:/home/node/.openclaw/workspace
+    networks:
+      - brain_net
+    ports:
+      - "18789:18789"
+    command:
+      [
+        "node",
+        "openclaw.mjs",
+        "gateway",
+        "--allow-unconfigured",
+        "--bind",
+        "lan",
+        "--port",
+        "18789",
+      ]
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2048M
+    security_opt:
+      - no-new-privileges:true
 
 networks:
   brain_net:

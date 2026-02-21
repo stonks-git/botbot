@@ -19,7 +19,7 @@
       },
       "autoCapture": {
         "type": "boolean",
-        "description": "Auto-capture user messages after agent ends (default: true)"
+        "description": "Auto-capture user + assistant messages after agent ends (default: true)"
       },
       "recallLimit": {
         "type": "number",
@@ -29,7 +29,7 @@
         "type": "number",
         "minimum": 10,
         "maximum": 10000,
-        "description": "Max message length for auto-capture (default: 500)"
+        "description": "Target chunk size for auto-capture — messages longer than this are split into semantic chunks (default: 500)"
       }
     }
   }

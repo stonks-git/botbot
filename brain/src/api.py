@@ -463,6 +463,7 @@ async def gate_memory(req: GateRequest):
 
     # Phase 4: load GutFeeling, pass attention_centroid + emotional_charge
     gut = _get_gut(req.agent_id)
+    mem_count = await store.memory_count(req.agent_id)
     try:
         decision, score, exit_meta = await _exit_gate.evaluate(
             req.content,
@@ -472,6 +473,7 @@ async def gate_memory(req: GateRequest):
             attention_embedding=gut.attention_centroid,
             emotional_charge=gut.emotional_charge,
             source_tag=req.source_tag,
+            memory_count=mem_count,
         )
     except RuntimeError as e:
         # Embedding failure -> keep in scratch buffer, don't lose data
