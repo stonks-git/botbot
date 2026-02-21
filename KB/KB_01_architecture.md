@@ -86,7 +86,7 @@ DELETE /memory/{memory_id}?agent_id=X
 | Method | Phase 1 API | Used by later phase |
 |--------|------------|---------------------|
 | `embed(text, task_type, title)` | store/retrieve | all |
-| `embed_batch(texts, ...)` | — | consolidation (P5) |
+| `embed_batch(texts, ...)` | — | consolidation (P5). True batch via Gemini API (CQ-008): 1 API call per 100 texts |
 | `store_memory(content, agent_id, ...)` | POST /store | all |
 | `store_insight(content, agent_id, source_ids, ...)` | — | consolidation (P5) |
 | `get_memory(id, agent_id)` | GET /{id} | all |
@@ -103,7 +103,7 @@ DELETE /memory/{memory_id}?agent_id=X
 | `buffer_scratch(content, agent_id, ...)` | — | gate (P2) |
 | `flush_scratch(agent_id, ...)` | — | gate (P2) |
 | `cleanup_expired_scratch(agent_id)` | — | gate (P2) |
-| `check_novelty(content, agent_id, threshold)` → `(bool, float, str\|None)` | — | gate (P2), consolidation (P5) |
+| `check_novelty(content, agent_id, threshold, embedding=None)` → `(bool, float, str\|None)` | — | gate (P2), consolidation (P5). Optional pre-computed embedding skips internal embed (CQ-010) |
 | `get_stale_memories(agent_id, ...)` | — | consolidation (P5) |
 | `decay_memories(ids, agent_id, factor)` | — | consolidation (P5) |
 | `avg_depth_weight_center(agent_id)` | — | consolidation (P5) |
@@ -149,7 +149,7 @@ api.py          ← memory, db
   Irrelevant   | Drop(0.05)     | Drop+noise     | Drop+noise
   ```
 - Relevance axis: `spreading_activation(content_embedding, attention, layers)` → core (≥0.6) / peripheral (≥0.3) / irrelevant
-- Novelty axis: `check_novelty()` → `(is_novel, max_similarity, most_similar_id)` + `detect_contradiction_negation()` → confirming (sim≥0.85) / novel (sim<0.6) / contradicting (sim≥0.7 + negation markers)
+- Novelty axis: `check_novelty(embedding=content_embedding)` → `(is_novel, max_similarity, most_similar_id)` + `detect_contradiction_negation()` → confirming (sim≥0.85) / novel (sim<0.6) / contradicting (sim≥0.7 + negation markers). Single embed call reused for both spreading_activation and novelty check (CQ-010). Contradiction fetches content via `get_memory(most_similar_id)` instead of re-searching.
 - **Gate touch** (D-012): after novelty check, calls `touch_memory(most_similar_id)` — refreshes `last_accessed` only (no access_count, no alpha/beta). Prevents decay for 24h on referenced memories. "Stay of execution, not a promotion."
 - Score: `base_score * (0.5 + 0.5 * s_i) * hunger_boost + emotional_charge_bonus`
 - **Hunger curve** (D-009): dynamic score multiplier based on memory count. Newborn agents (0 memories) get `hunger_max_boost=2.5`, decaying exponentially (`exp(-count/10)`) toward 1.0 as memories accumulate. When hunger-boosted score ≥ 0.5 and hunger > 1.05, BUFFER is promoted to PERSIST. This solves the cold-start problem where newborn agents couldn't form memories because everything scored as peripheral×novel→buffer.
@@ -167,9 +167,11 @@ Pipeline: entry gate → scratch buffer → exit gate → act on decision:
 - REINFORCE → find most similar memory + `apply_retrieval_mutation()`
 - BUFFER → leave in scratch (24h TTL, consolidation picks up later)
 
-**`apply_retrieval_mutation()` internals** (D-013): Two separate UPDATE operations:
-1. **access_count** (unconditional): `access_count += 1`, `last_accessed = NOW()`, append to `access_timestamps`. Not subject to safety checks. Skips immutable.
-2. **alpha boost** (safety-gated): `depth_weight_alpha += gain` (0.1 default, 0.2 for dormant high-score). Goes through DiminishingReturns + TwoGateGuardrail. Skips immutable.
+**`apply_retrieval_mutation()` internals** (D-013, batched T-B01): Three batch phases:
+1. **access_count** (batch, unconditional): single `UPDATE ... WHERE id = ANY($1) AND NOT immutable` — increments `access_count`, sets `last_accessed`, appends to `access_timestamps`.
+2. **alpha boost**: If no safety monitor and no vector_scores: single batch `UPDATE ... WHERE id = ANY($1)` with uniform +0.1. If safety wired: batch-fetches all memories in one query, computes per-memory gain via `check_weight_change()`, per-memory UPDATEs (safety returns different gains).
+3. **near-miss beta** (batch): single `UPDATE ... WHERE id = ANY($1) AND NOT immutable` — bumps `depth_weight_beta += 0.05`. No separate immutability check needed.
+- **Co-access** (`relevance.py:update_co_access`): batch UPSERT via `unnest($1::text[], $2::text[])` — all pairs in one round-trip.
 - DROP/SKIP → clean up scratch
 
 **Plugin update** (`openclaw/extensions/memory-brain/index.ts`):
@@ -199,7 +201,7 @@ stochastic.py   ← standalone
 activation.py   ← numpy
 relevance.py    ← activation
 memory.py       ← config, relevance, db (pool)
-gate.py         ← activation, memory (embed, check_novelty, search_similar)
+gate.py         ← activation, memory (embed, check_novelty, get_memory)
 api.py          ← memory, gate, db
 ```
 
@@ -209,14 +211,18 @@ api.py          ← memory, gate, db
 
 **Brain modules:**
 - `brain/src/context_assembly.py` — dynamic context injection + identity rendering:
-  - `assemble_context(memory_store, agent_id, ...)` — Track 0 (immutable safety) + identity hash + Track 2 (stochastic identity memories, Beta-sampled `observe() > 0.6`) + Track 1 (situational via `search_hybrid(mutate=False)`). Returns `injected_memory_ids` — IDs of non-immutable memories that survived budget trimming and were actually injected.
+  - `assemble_context(memory_store, agent_id, ...)` — Track 0 (immutable safety) + active identity (D-015: w×s scored) + Track 1 (situational via `search_hybrid(mutate=False)`). Returns `injected_memory_ids` — IDs of non-immutable memories that survived budget trimming and were actually injected.
+  - **Active identity (D-015/DJ-005):** Embeds `query_text` with `RETRIEVAL_QUERY` task type, calls `memory_store.score_identity_wxs(query_vec, agent_id)` which computes `injection_score = weight_center × cosine_sim` in SQL via pgvector `<=>`. Memories ranked by injection_score, injected within `BUDGET_IDENTITY_MAX` token budget. No query = no identity injection (relevance is mandatory per DJ-005). Replaces stochastic Beta-sampling.
+  - **Identity hash (D-017/DJ-006):** Feature-flagged dormant via `IDENTITY_HASH_ENABLED = False`. `render_identity_hash()` skipped during assembly but still callable via API endpoints.
   - **Retrieval mutation** (D-012): after assembly, `api.py` calls `apply_retrieval_mutation(injected_ids)` — increments `access_count` + boosts `depth_weight_alpha` for memories that influenced the agent's output. access_count always increments (factual counter); alpha boost goes through safety check (D-013).
   - Token budgets: identity max 3000, situational 2000, output buffer 4000
-  - `render_system_prompt()` → `[SAFETY BOUNDARIES]`, `[IDENTITY]`, `[IDENTITY -- active beliefs/values]`, `[RELEVANT MEMORIES]`, cognitive state
-  - `render_identity_hash(memory_store, agent_id)` — compact ~100-200 tokens from top-10 memories by weight center (replaces LayerStore.render_identity_hash)
+  - `render_system_prompt()` → `[SAFETY BOUNDARIES]`, `[IDENTITY]` (hash, dormant), `[ACTIVE IDENTITY]` (w×s memories), `[RELEVANT MEMORIES]`, `[COGNITIVE STATE]`
+  - `render_identity_hash(memory_store, agent_id)` — compact ~100-200 tokens from top-10 memories by weight center (used by API only when hash dormant)
   - `render_identity_full(memory_store, agent_id)` — full ~1-2k tokens grouped by memory type from top-30 memories (replaces LayerStore.render_identity_full)
+  - **Injection logging (D-018d):** After w×s scoring, every candidate is logged to `injection_logs` table with weight_center, cosine_sim, injection_score, was_injected (budget-accepted or not), query_hash (SHA-256[:16] of query_text). Non-blocking (try/except wrapped). Batch INSERT via `pool.executemany()`.
   - `adaptive_fifo_prune()` — intensity-adaptive context pruning (for future use)
   - Context inertia: shift = 1-cosine(current, previous attention), inertia 5% if shift>0.7, else 30% (Phase 4 wires attention)
+- `brain/src/memory.py` — `score_identity_wxs(query_vec, agent_id, top_n)` — SQL-native w×s identity scoring. Computes `(alpha/(alpha+beta)) * (1 - (embedding <=> query::halfvec))` in DB. Excludes immutables. Returns candidates ranked by injection_score DESC.
 
 **Gate wiring — `_get_identity_embeddings()` in `api.py`:**
 - Queries top-N memories by weight center (`depth_weight_alpha / (depth_weight_alpha + depth_weight_beta) > 0.3`) from DB
@@ -236,6 +242,9 @@ GET /identity/{agent_id}
 
 GET /identity/{agent_id}/hash
   Response: { agent_id, hash: "<compact render from top memories>" }
+
+GET /injection/metrics?agent_id=X&days=7
+  Response: { agent_id, days, total_logs, injection_rate, score_stats: { avg, p50, p75, p95 }, top_memories: [{ memory_id, count, avg_score }] }
 ```
 Note: No PUT /identity endpoint — identity changes via memory reinforce/contradict, not direct edit.
 
@@ -297,7 +306,7 @@ relevance.py         <- activation
 memory.py            <- config, relevance, db (pool)
 gate.py              <- activation, memory
 gut.py               <- activation (cosine_similarity), numpy, json, pathlib
-context_assembly.py  <- stochastic, activation (cosine_similarity)
+context_assembly.py  <- activation (cosine_similarity)
 api.py               <- memory, gate, context_assembly, gut, db, numpy
 ```
 
@@ -316,8 +325,8 @@ api.py               <- memory, gate, context_assembly, gut, db, numpy
     - `_pattern_detection()` every 15min: fetch 50 recent memories (7d), greedy cosine cluster at 0.85, log clusters with 3+ members
   - **Tier 2 (DeepConsolidation)** -- hourly or triggered:
     - `_merge_and_insight()`: LLM generates questions from recent memories, extracts insights via search_similar + LLM. D-023: novelty-checked, if sim>=0.85 reinforces existing via apply_retrieval_mutation instead of creating new. Clusters reflections into first-person narratives (also novelty-checked).
-    - `_promote_patterns()`: D-005 simplified -- direct SQL alpha updates. Goal promotion (5+ access, 14d+, center<0.65, alpha+=2.0). Identity promotion (10+ access, 30d+, center 0.65-0.82, alpha+=5.0).
-    - `_decay_and_reconsolidate()`: stale memories (90d, <3 access) get beta+=1.0. Revalidates existing insights via LLM. D-023: novelty-checked before storing updated insight.
+    - `_promote_patterns()`: D-005 simplified. Goal promotion (5+ access, 14d+, center<0.65, alpha+=2.0). Identity promotion (10+ access, 30d+, center 0.65-0.82, alpha+=5.0). **CQ-005 fix:** all alpha boosts routed through `safety.check_weight_change()` — HardCeiling (0.95) and DiminishingReturns enforced. Blocked promotions counted and logged.
+    - `_decay_and_reconsolidate()`: stale memories (90d, <3 access) get beta+=1.0. Revalidates existing insights via LLM. D-023: novelty-checked before storing updated insight. **CQ-006 fix:** deep decay and insight weakening (beta+=1.0) routed through `safety.check_weight_change()`. Stale decay: per-row safety check, then batch UPDATE on allowed IDs. Insight weakening: per-row safety check before UPDATE.
     - `_tune_parameters()`: Shannon entropy over 20 bins of weight centers, log only.
     - `_contextual_retrieval()`: generates WHO/WHEN/WHY preambles via LLM, updates content_contextualized column, re-embeds with contextualized content.
   - **ConsolidationEngine** -- runs both tiers via asyncio.gather(), supports trigger + status
@@ -325,7 +334,7 @@ api.py               <- memory, gate, context_assembly, gut, db, numpy
 
 - Error isolation: every operation wrapped in individual try/except, one failing agent/operation does not crash the engine
 - Multi-agent: iterates SELECT DISTINCT agent_id FROM memories each cycle
-- All operations log to consolidation_log table
+- All operations log to consolidation_log table. CQ-014 fix: `_log_consolidation()` passes dict directly to asyncpg (not `json.dumps()`). asyncpg's JSONB codec serializes internally; pre-serializing caused double-serialization (details stored as JSON string literals, not objects).
 - Insight linking via memory_supersedes table. D-025: store_insight inherits weighted-avg alpha/beta from sources, no source importance demotion.
 
 BUG-001 (Session 18): gemini-3-flash-preview is a thinking model. Internal chain-of-thought consumes from max_output_tokens budget. With default max_tokens=200, model spent approx 180 on thinking, left approx 20 for output. All consolidation insights were sentence fragments. Fix: remove max_output_tokens cap.
@@ -355,7 +364,7 @@ relevance.py         <- activation
 memory.py            <- config, relevance, db (pool)
 gate.py              <- activation, memory
 gut.py               <- activation (cosine_similarity), numpy, json, pathlib
-context_assembly.py  <- stochastic, activation (cosine_similarity)
+context_assembly.py  <- activation (cosine_similarity)
 llm.py               <- config (RetryConfig), google-genai
 consolidation.py     <- llm, memory, activation (cosine_similarity), numpy, asyncpg (direct pool for logging)
 api.py               <- memory, gate, context_assembly, gut, consolidation, db, numpy
@@ -387,7 +396,7 @@ api.py               <- memory, gate, context_assembly, gut, consolidation, db, 
     - Introspective (25%): type IN (reflection, narrative, preference, tension), center > 0.6
   - **Output channel classification** (`_classify_channel`):
     1. Goal: keyword overlap ≥ 3 with top-5 high-weight narrative/reflection memories → `DMN/goal`
-    2. Creative: `spread_activation(hops=2)` via co-access network → `DMN/creative`
+    2. Creative: `spread_activation(hops=2)` via co-access network, requires `max(scores) >= 0.15` (MIN_CREATIVE_ACTIVATION) → `DMN/creative`. At hop 0, 0.15 needs ≥3 co-accesses. CQ-025 fix: was `len(activated) > 0` which always triggered with any co-access.
     3. Identity: reflective memory types → `DMN/identity`
     4. Default: `DMN/reflect`
   - **Thread lifecycle**: `_start_new_thread()` calls LLM (temperature=0.6), `_continue_thread()` calls LLM (temperature=0.5, checks for "THREAD_RESOLVED")
@@ -399,6 +408,14 @@ api.py               <- memory, gate, context_assembly, gut, consolidation, db, 
 ```sql
 dmn_log (id SERIAL PK, agent_id TEXT, thought TEXT, channel TEXT, source_memory_id TEXT, created_at TIMESTAMPTZ)
 idx_dmn_log_agent ON dmn_log (agent_id, created_at DESC)
+```
+
+**DB table** — `injection_logs` (D-018d, T-P13):
+```sql
+injection_logs (id SERIAL PK, agent_id TEXT, memory_id TEXT, weight_center FLOAT, cosine_sim FLOAT, injection_score FLOAT, was_injected BOOLEAN, query_hash TEXT, created_at TIMESTAMPTZ)
+idx_injection_logs_agent ON injection_logs (agent_id, created_at DESC)
+idx_injection_logs_memory ON injection_logs (memory_id)
+idx_injection_logs_query ON injection_logs (query_hash)
 ```
 
 **API endpoints** (in `brain/src/api.py`, version 0.6.0):
@@ -415,7 +432,7 @@ POST /dmn/activity
 
 GET  /monologue/{agent_id}?limit=50
   Response (MonologueResponse): { agent_id, entries: [{ ts, type, content, channel?, operation?, source_memory_id?, memory_id?, details? }], rumination: { active?, recent_completed[] } }
-  Unified view combining: dmn_log (thoughts), consolidation_log (operations), memories (tension/narrative/reflection), rumination state (active thread + recent completed)
+  Unified view combining: dmn_log (thoughts), consolidation_log (operations), memories (tension/narrative/reflection), rumination state (active thread + recent completed). CQ-023 fix: completed thread reason read from `"reason"` key (matching rumination.py's archive format).
 ```
 
 **Plugin update** (`openclaw/extensions/memory-brain/index.ts`):
@@ -434,7 +451,7 @@ GET  /monologue/{agent_id}?limit=50
   - **OutcomeTracker**: records gate_decision/promotion/demotion events, forward-linkable via `link_outcome()`, max 2000 records
   - Module-level `_audit_log` (list[dict], max 1000), `log_safety_event()`, `get_audit_log()`
 - Wired in `api.py` lifespan: `SafetyMonitor()` -> `_memory_store.safety`
-- Wired in `consolidation.py`: `_deep_cycle()` calls `safety.enable_phase_b()` at start, `safety.end_consolidation_cycle(cycle_id)` at end (in finally block)
+- Wired in `consolidation.py`: `_deep_cycle()` calls `safety.enable_phase_b()` at start, `safety.end_consolidation_cycle(cycle_id)` at end (in finally block). `_current_cycle_id` instance attribute on DeepConsolidation plumbs cycle_id to step functions (`_promote_patterns`, `_decay_and_reconsolidate`) for Phase B rate limiting.
 - `memory.py:422-431`: existing call site uses `self.safety.check_weight_change()` for retrieval mutation -- now active
 
 **API** (2 new endpoints, version 0.6.0):
@@ -451,7 +468,7 @@ safety.py            <- standalone (math, logging, uuid only)
 memory.py            <- config, relevance, db (pool); safety wired at runtime
 gate.py              <- activation, memory
 gut.py               <- activation (cosine_similarity), numpy, json, pathlib
-context_assembly.py  <- stochastic, activation (cosine_similarity)
+context_assembly.py  <- activation (cosine_similarity)
 llm.py               <- config (RetryConfig), google-genai
 consolidation.py     <- llm, memory, activation, numpy, asyncpg; safety via memory.store.safety
 rumination.py        <- json, pathlib (standalone)
@@ -473,10 +490,10 @@ api.py               <- memory, gate, context_assembly, gut, consolidation, idle
     2. First Retrieval — `access_count > 0`
     3. First Consolidation — `consolidation_log WHERE agent_id` count > 0
     4. Goal-Weight Promotion — non-immutable memory with center > 0.6
-    5. First DMN Self-Prompt — `source_tag = 'internal_dmn'`
+    5. First DMN Self-Prompt — `dmn_log WHERE agent_id` count > 0 (CQ-019 fix: was checking memories for source_tag='internal_dmn' but DMN writes to dmn_log)
     6. Identity-Weight Promotion — non-immutable memory with center > 0.8
-    7. Conflict Resolution — tension type with `metadata->>'resolved' = 'true'`
-    8. Creative Association — `metadata ? 'creative_insight'`
+    7. Conflict Detection — `memories WHERE type='tension'` count > 0 (CQ-019 fix: was checking metadata->>'resolved'='true' which nothing sets)
+    8. Creative Association — `memories WHERE type='narrative'` count > 0 (CQ-019 fix: was checking metadata ? 'creative_insight' which nothing sets)
     9. Goal Reflected — reflection type with content matching goal/achieved
     10. Autonomous Decision — 3+ identity-weight (center>0.8) AND 2+ reflections
 
@@ -493,7 +510,7 @@ safety.py            <- standalone (math, logging, uuid only)
 memory.py            <- config, relevance, db (pool); safety wired at runtime
 gate.py              <- activation, memory
 gut.py               <- activation (cosine_similarity), numpy, json, pathlib
-context_assembly.py  <- stochastic, activation (cosine_similarity)
+context_assembly.py  <- activation (cosine_similarity)
 llm.py               <- config (RetryConfig), google-genai
 consolidation.py     <- llm, memory, activation, numpy, asyncpg; safety via memory.store.safety
 rumination.py        <- json, pathlib (standalone)

@@ -73,14 +73,45 @@ class MemoryStore:
         task_type: str = "RETRIEVAL_DOCUMENT",
         title: str | None = None,
     ) -> list[list[float]]:
-        """Batch embed, chunks of 100."""
-        results = []
+        """True batch embed via Gemini batch API, chunks of 100."""
+        if not self.genai_client:
+            raise RuntimeError("Embedding unavailable: no GOOGLE_API_KEY.")
+        if not texts:
+            return []
+
+        cfg = self.retry_config
+        results: list[list[float]] = []
         for i in range(0, len(texts), 100):
             chunk = texts[i : i + 100]
-            chunk_results = await asyncio.gather(
-                *[self.embed(t, task_type=task_type, title=title) for t in chunk]
-            )
-            results.extend(chunk_results)
+            last_err = None
+            for attempt in range(cfg.max_retries):
+                try:
+                    kwargs: dict[str, Any] = {
+                        "model": EMBED_MODEL,
+                        "contents": chunk,
+                        "config": {
+                            "task_type": task_type,
+                            "output_dimensionality": EMBED_DIMENSIONS,
+                        },
+                    }
+                    if title:
+                        kwargs["config"]["title"] = title
+                    result = self.genai_client.models.embed_content(**kwargs)
+                    results.extend(emb.values for emb in result.embeddings)
+                    break
+                except Exception as e:
+                    last_err = e
+                    delay = min(cfg.base_delay * (2**attempt), cfg.max_delay)
+                    logger.warning(
+                        "Batch embed attempt %d failed (%d texts): %s (retry in %.1fs)",
+                        attempt + 1, len(chunk), e, delay,
+                    )
+                    await asyncio.sleep(delay)
+            else:
+                raise RuntimeError(
+                    f"Batch embedding failed after {cfg.max_retries} attempts: {last_err}"
+                )
+        logger.debug("Batch embedded %d texts in %d API calls", len(texts), -(-len(texts) // 100))
         return results
 
     # ── Helpers ────────────────────────────────────────────────────────
@@ -429,6 +460,37 @@ class MemoryStore:
 
         return results
 
+    # ── Identity scoring (D-015) ─────────────────────────────────────
+
+    async def score_identity_wxs(
+        self,
+        query_vec: list[float],
+        agent_id: str,
+        top_n: int = 20,
+    ) -> list[dict]:
+        """Score identity memories by weight_center × cosine_sim (D-015).
+
+        Computes injection_score entirely in SQL. Excludes immutables
+        (handled by Track 0). Returns candidates ranked by injection_score.
+        """
+        rows = await self.pool.fetch(
+            """
+            SELECT id, content, depth_weight_alpha, depth_weight_beta,
+                   (depth_weight_alpha / (depth_weight_alpha + depth_weight_beta))
+                     * (1 - (embedding <=> $1::halfvec)) AS injection_score
+            FROM memories
+            WHERE agent_id = $2
+              AND embedding IS NOT NULL
+              AND immutable = false
+            ORDER BY injection_score DESC
+            LIMIT $3
+            """,
+            str(query_vec),
+            agent_id,
+            top_n,
+        )
+        return [dict(r) for r in rows]
+
     # ── Mutation ───────────────────────────────────────────────────────
 
     async def apply_retrieval_mutation(
@@ -440,34 +502,53 @@ class MemoryStore:
     ) -> None:
         """Retrieval-induced strengthening/weakening of memory weights."""
         now = datetime.now(timezone.utc)
-        for mem_id in retrieved_ids:
-            # Always increment access_count (factual counter, not subject to safety)
-            await self.pool.execute(
+
+        if not retrieved_ids:
+            return
+
+        # 1. Batch update access_count + last_accessed + timestamps (CQ-002)
+        await self.pool.execute(
+            """
+            UPDATE memories
+            SET access_count = access_count + 1,
+                last_accessed = $1,
+                access_timestamps = array_append(
+                    COALESCE(access_timestamps, ARRAY[]::timestamptz[]), $1
+                ),
+                updated_at = $1
+            WHERE id = ANY($2) AND agent_id = $3 AND NOT immutable
+            """,
+            now,
+            retrieved_ids,
+            agent_id,
+        )
+
+        # 2. Alpha boost
+        needs_per_memory = bool(vector_scores) or bool(self.safety)
+        if needs_per_memory:
+            # Batch-fetch memories for safety/novelty-bonus checks (CQ-002)
+            rows = await self.pool.fetch(
                 """
-                UPDATE memories
-                SET access_count = access_count + 1,
-                    last_accessed = $1,
-                    access_timestamps = array_append(
-                        COALESCE(access_timestamps, ARRAY[]::timestamptz[]), $1
-                    ),
-                    updated_at = $1
-                WHERE id = $2 AND agent_id = $3 AND NOT immutable
+                SELECT id, access_count, depth_weight_alpha, depth_weight_beta
+                FROM memories
+                WHERE id = ANY($1) AND agent_id = $2 AND NOT immutable
                 """,
-                now,
-                mem_id,
+                retrieved_ids,
                 agent_id,
             )
+            mem_map = {r["id"]: dict(r) for r in rows}
 
-            # Alpha boost is subject to safety checks
-            gain = 0.1
-            if vector_scores and vector_scores.get(mem_id, 0) > 0.9:
-                mem = await self.get_memory(mem_id, agent_id)
-                if mem and mem.get("access_count", 0) == 0:
-                    gain = 0.2
+            for mem_id in retrieved_ids:
+                mem = mem_map.get(mem_id)
+                if not mem:
+                    continue
 
-            if self.safety:
-                mem = mem if 'mem' in dir() else await self.get_memory(mem_id, agent_id)
-                if mem:
+                gain = 0.1
+                if vector_scores and vector_scores.get(mem_id, 0) > 0.9:
+                    if mem.get("access_count", 0) == 0:
+                        gain = 0.2
+
+                if self.safety:
                     allowed, adj_alpha, _adj_beta, _reasons = self.safety.check_weight_change(
                         mem_id, mem["depth_weight_alpha"], mem["depth_weight_beta"],
                         delta_alpha=gain,
@@ -476,40 +557,45 @@ class MemoryStore:
                         continue
                     gain = adj_alpha
 
-            await self.pool.execute(
-                """
-                UPDATE memories
-                SET depth_weight_alpha = depth_weight_alpha + $2,
-                    updated_at = $1
-                WHERE id = $3 AND agent_id = $4 AND NOT immutable
-                """,
-                now,
-                gain,
-                mem_id,
-                agent_id,
-            )
-
-        if near_miss_ids:
-            for mem_id in near_miss_ids:
-                # Check immutability before weakening
-                is_immutable = await self.pool.fetchval(
-                    "SELECT immutable FROM memories WHERE id = $1 AND agent_id = $2",
-                    mem_id,
-                    agent_id,
-                )
-                if is_immutable:
-                    continue
                 await self.pool.execute(
                     """
                     UPDATE memories
-                    SET depth_weight_beta = depth_weight_beta + 0.05,
+                    SET depth_weight_alpha = depth_weight_alpha + $2,
                         updated_at = $1
-                    WHERE id = $2 AND agent_id = $3
+                    WHERE id = $3 AND agent_id = $4 AND NOT immutable
                     """,
                     now,
+                    gain,
                     mem_id,
                     agent_id,
                 )
+        else:
+            # No safety, no vector_scores — uniform +0.1 batch (CQ-002)
+            await self.pool.execute(
+                """
+                UPDATE memories
+                SET depth_weight_alpha = depth_weight_alpha + 0.1,
+                    updated_at = $1
+                WHERE id = ANY($2) AND agent_id = $3 AND NOT immutable
+                """,
+                now,
+                retrieved_ids,
+                agent_id,
+            )
+
+        # 3. Near-miss beta bump — single batch (CQ-003)
+        if near_miss_ids:
+            await self.pool.execute(
+                """
+                UPDATE memories
+                SET depth_weight_beta = depth_weight_beta + 0.05,
+                    updated_at = $1
+                WHERE id = ANY($2) AND agent_id = $3 AND NOT immutable
+                """,
+                now,
+                near_miss_ids,
+                agent_id,
+            )
 
     async def touch_memory(
         self,
@@ -591,12 +677,14 @@ class MemoryStore:
         content: str,
         agent_id: str,
         threshold: float = 0.85,
+        embedding: list[float] | None = None,
     ) -> tuple[bool, float, str | None]:
         """Check if content is novel compared to existing memories.
 
         Returns (is_novel, max_similarity, most_similar_id).
+        If embedding is provided, skips the internal embed() call.
         """
-        vec = await self.embed(content, task_type="SEMANTIC_SIMILARITY")
+        vec = embedding if embedding is not None else await self.embed(content, task_type="SEMANTIC_SIMILARITY")
         row = await self.pool.fetchrow(
             """
             SELECT id, 1 - (embedding <=> $1::halfvec) AS similarity
@@ -621,7 +709,8 @@ class MemoryStore:
     ) -> list[dict]:
         rows = await self.pool.fetch(
             """
-            SELECT id, content, importance, access_count, last_accessed
+            SELECT id, content, importance, access_count, last_accessed,
+                   depth_weight_alpha, depth_weight_beta
             FROM memories
             WHERE agent_id = $1
               AND (last_accessed IS NULL OR last_accessed < NOW() - INTERVAL '1 day' * $2)

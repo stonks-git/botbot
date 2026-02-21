@@ -177,16 +177,21 @@ async def update_co_access(pool, memory_ids: list[str], agent_id: str) -> None:
             a, b = (mid_a, mid_b) if mid_a < mid_b else (mid_b, mid_a)
             pairs.append((a, b))
 
-    for a, b in pairs:
-        await pool.execute(
-            """
-            INSERT INTO memory_co_access (memory_id_a, memory_id_b, agent_id, co_access_count, last_co_accessed)
-            VALUES ($1, $2, $3, 1, NOW())
-            ON CONFLICT (memory_id_a, memory_id_b)
-            DO UPDATE SET co_access_count = memory_co_access.co_access_count + 1,
-                         last_co_accessed = NOW()
-            """,
-            a,
-            b,
-            agent_id,
-        )
+    if not pairs:
+        return
+
+    # Batch UPSERT all pairs in one round-trip (CQ-004)
+    a_ids = [p[0] for p in pairs]
+    b_ids = [p[1] for p in pairs]
+    await pool.execute(
+        """
+        INSERT INTO memory_co_access (memory_id_a, memory_id_b, agent_id, co_access_count, last_co_accessed)
+        SELECT unnest($1::text[]), unnest($2::text[]), $3, 1, NOW()
+        ON CONFLICT (memory_id_a, memory_id_b)
+        DO UPDATE SET co_access_count = memory_co_access.co_access_count + 1,
+                     last_co_accessed = NOW()
+        """,
+        a_ids,
+        b_ids,
+        agent_id,
+    )

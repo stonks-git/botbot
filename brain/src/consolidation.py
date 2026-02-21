@@ -8,7 +8,6 @@ D-005: No L0/L1 writes. Promotion reinforces weights directly in the unified tab
 """
 
 import asyncio
-import json
 import logging
 import math
 import random
@@ -65,6 +64,10 @@ async def _log_consolidation(
     details: dict,
 ) -> None:
     """Write to the consolidation_log table."""
+    # Pass dict directly — asyncpg's default JSONB codec calls json.dumps()
+    # internally. Pre-serializing with json.dumps() caused double-serialization
+    # (CQ-014): DB stored JSON string literals instead of objects, making
+    # details->>'key' queries return NULL and isinstance(details, dict) fail.
     await pool.execute(
         """
         INSERT INTO consolidation_log (agent_id, operation, details)
@@ -72,7 +75,7 @@ async def _log_consolidation(
         """,
         agent_id,
         operation,
-        json.dumps(details, default=str),
+        details,
     )
 
 
@@ -344,6 +347,7 @@ class DeepConsolidation:
         self._last_deep: float = 0.0
         self._trigger_agents: set[str] = set()
         self._running: bool = False
+        self._current_cycle_id: str | None = None
 
     def trigger(self, agent_id: str) -> None:
         """Queue an agent for immediate deep consolidation."""
@@ -404,6 +408,7 @@ class DeepConsolidation:
 
         # Enable Phase B safety for consolidation cycle
         cycle_id = f"deep_{agent_id}_{int(time.time())}"
+        self._current_cycle_id = cycle_id
         safety = self.store.safety
         if safety:
             safety.enable_phase_b()
@@ -425,6 +430,7 @@ class DeepConsolidation:
                 self._contextual_retrieval, agent_id
             )
         finally:
+            self._current_cycle_id = None
             if safety:
                 safety.end_consolidation_cycle(cycle_id)
 
@@ -638,12 +644,16 @@ class DeepConsolidation:
     async def _promote_patterns(self, agent_id: str) -> dict:
         """Promote frequently accessed memories by reinforcing weights directly."""
         goals_promoted = 0
+        goals_blocked = 0
         identities_promoted = 0
+        identities_blocked = 0
+        safety = self.store.safety
 
         # Goal promotion: 5+ access, 14+ days old, center < 0.65
         goal_candidates = await self.pool.fetch(
             """
             SELECT id, content, access_count,
+                   depth_weight_alpha, depth_weight_beta,
                    depth_weight_alpha / (depth_weight_alpha + depth_weight_beta) AS center
             FROM memories
             WHERE agent_id = $1
@@ -657,6 +667,19 @@ class DeepConsolidation:
             PROMOTE_GOAL_MIN_DAYS,
         )
         for row in goal_candidates:
+            gain = PROMOTE_GOAL_REINFORCE
+            if safety:
+                allowed, adj_alpha, _adj_beta, _reasons = safety.check_weight_change(
+                    row["id"],
+                    float(row["depth_weight_alpha"]),
+                    float(row["depth_weight_beta"]),
+                    delta_alpha=gain,
+                    cycle_id=self._current_cycle_id,
+                )
+                if not allowed:
+                    goals_blocked += 1
+                    continue
+                gain = adj_alpha
             await self.pool.execute(
                 """
                 UPDATE memories
@@ -664,7 +687,7 @@ class DeepConsolidation:
                     updated_at = NOW()
                 WHERE id = $2 AND agent_id = $3
                 """,
-                PROMOTE_GOAL_REINFORCE,
+                gain,
                 row["id"],
                 agent_id,
             )
@@ -674,6 +697,7 @@ class DeepConsolidation:
         identity_candidates = await self.pool.fetch(
             """
             SELECT id, content, access_count,
+                   depth_weight_alpha, depth_weight_beta,
                    depth_weight_alpha / (depth_weight_alpha + depth_weight_beta) AS center
             FROM memories
             WHERE agent_id = $1
@@ -687,6 +711,19 @@ class DeepConsolidation:
             PROMOTE_IDENTITY_MIN_DAYS,
         )
         for row in identity_candidates:
+            gain = PROMOTE_IDENTITY_REINFORCE
+            if safety:
+                allowed, adj_alpha, _adj_beta, _reasons = safety.check_weight_change(
+                    row["id"],
+                    float(row["depth_weight_alpha"]),
+                    float(row["depth_weight_beta"]),
+                    delta_alpha=gain,
+                    cycle_id=self._current_cycle_id,
+                )
+                if not allowed:
+                    identities_blocked += 1
+                    continue
+                gain = adj_alpha
             await self.pool.execute(
                 """
                 UPDATE memories
@@ -694,43 +731,67 @@ class DeepConsolidation:
                     updated_at = NOW()
                 WHERE id = $2 AND agent_id = $3
                 """,
-                PROMOTE_IDENTITY_REINFORCE,
+                gain,
                 row["id"],
                 agent_id,
             )
             identities_promoted += 1
 
-        if goals_promoted or identities_promoted:
+        if goals_promoted or identities_promoted or goals_blocked or identities_blocked:
             logger.info(
-                "Promote [%s]: %d goals, %d identities",
+                "Promote [%s]: %d goals (%d blocked), %d identities (%d blocked)",
                 agent_id,
                 goals_promoted,
+                goals_blocked,
                 identities_promoted,
+                identities_blocked,
             )
             await _log_consolidation(
                 self.pool,
                 agent_id,
                 "promote_patterns",
-                {"goals_promoted": goals_promoted, "identities_promoted": identities_promoted},
+                {
+                    "goals_promoted": goals_promoted,
+                    "goals_blocked": goals_blocked,
+                    "identities_promoted": identities_promoted,
+                    "identities_blocked": identities_blocked,
+                },
             )
         return {
             "status": "ok",
             "goals_promoted": goals_promoted,
+            "goals_blocked": goals_blocked,
             "identities_promoted": identities_promoted,
+            "identities_blocked": identities_blocked,
         }
 
     # -- Decay and Reconsolidate --
 
     async def _decay_and_reconsolidate(self, agent_id: str) -> dict:
         """Deep decay for truly stale memories + revalidate existing insights."""
-        # Decay stale memories (beta += 1.0)
+        # Decay stale memories (beta += 1.0) — per-row safety check
         stale = await self.store.get_stale_memories(
             agent_id,
             stale_days=DECAY_STALE_DAYS,
             min_access_count=DECAY_MIN_ACCESS,
         )
-        stale_ids = [m["id"] for m in stale]
-        if stale_ids:
+        safety = self.store.safety
+        decayed_ids = []
+        decay_blocked = 0
+        for m in stale:
+            if safety:
+                allowed, _adj_alpha, adj_beta, _reasons = safety.check_weight_change(
+                    m["id"],
+                    float(m["depth_weight_alpha"]),
+                    float(m["depth_weight_beta"]),
+                    delta_beta=DECAY_CONTRADICT_AMOUNT,
+                    cycle_id=self._current_cycle_id,
+                )
+                if not allowed:
+                    decay_blocked += 1
+                    continue
+            decayed_ids.append(m["id"])
+        if decayed_ids:
             await self.pool.execute(
                 """
                 UPDATE memories
@@ -739,10 +800,13 @@ class DeepConsolidation:
                 WHERE id = ANY($2) AND agent_id = $3
                 """,
                 DECAY_CONTRADICT_AMOUNT,
-                stale_ids,
+                decayed_ids,
                 agent_id,
             )
-            logger.info("Deep decay [%s]: %d memories", agent_id, len(stale_ids))
+            logger.info(
+                "Deep decay [%s]: %d memories (%d blocked)",
+                agent_id, len(decayed_ids), decay_blocked,
+            )
 
         # Revalidate existing insights
         insights_revalidated = 0
@@ -750,7 +814,8 @@ class DeepConsolidation:
 
         insight_rows = await self.pool.fetch(
             """
-            SELECT id, content FROM memories
+            SELECT id, content, depth_weight_alpha, depth_weight_beta
+            FROM memories
             WHERE agent_id = $1
               AND type = 'reflection'
               AND source = 'consolidation'
@@ -801,17 +866,27 @@ class DeepConsolidation:
                             metadata={"phase": "revalidation", "replaces": insight_row["id"]},
                         )
                     # Weaken old insight (superseded regardless)
-                    await self.pool.execute(
-                        """
-                        UPDATE memories
-                        SET depth_weight_beta = depth_weight_beta + $1,
-                            updated_at = NOW()
-                        WHERE id = $2 AND agent_id = $3
-                        """,
-                        DECAY_CONTRADICT_AMOUNT,
-                        insight_row["id"],
-                        agent_id,
-                    )
+                    weaken_allowed = True
+                    if safety:
+                        weaken_allowed, _, _, _ = safety.check_weight_change(
+                            insight_row["id"],
+                            float(insight_row["depth_weight_alpha"]),
+                            float(insight_row["depth_weight_beta"]),
+                            delta_beta=DECAY_CONTRADICT_AMOUNT,
+                            cycle_id=self._current_cycle_id,
+                        )
+                    if weaken_allowed:
+                        await self.pool.execute(
+                            """
+                            UPDATE memories
+                            SET depth_weight_beta = depth_weight_beta + $1,
+                                updated_at = NOW()
+                            WHERE id = $2 AND agent_id = $3
+                            """,
+                            DECAY_CONTRADICT_AMOUNT,
+                            insight_row["id"],
+                            agent_id,
+                        )
                     insights_updated += 1
             except Exception as e:
                 logger.warning("Insight revalidation failed: %s", e)
@@ -821,14 +896,16 @@ class DeepConsolidation:
             agent_id,
             "decay_and_reconsolidate",
             {
-                "stale_decayed": len(stale_ids),
+                "stale_decayed": len(decayed_ids),
+                "stale_blocked": decay_blocked,
                 "insights_revalidated": insights_revalidated,
                 "insights_updated": insights_updated,
             },
         )
         return {
             "status": "ok",
-            "stale_decayed": len(stale_ids),
+            "stale_decayed": len(decayed_ids),
+            "stale_blocked": decay_blocked,
             "insights_revalidated": insights_revalidated,
             "insights_updated": insights_updated,
         }

@@ -873,7 +873,7 @@ async def monologue(agent_id: str, limit: int = Query(default=50, ge=1, le=200))
             rumination.recent_completed = [
                 {
                     "topic": ct.get("topic", "")[:100],
-                    "resolution_reason": ct.get("resolution_reason", ""),
+                    "resolution_reason": ct.get("reason", ""),
                     "cycles": ct.get("cycles", 0),
                 }
                 for ct in (rm.completed_threads[-5:] if rm.completed_threads else [])
@@ -915,6 +915,84 @@ async def safety_audit(limit: int = Query(default=50, ge=1, le=1000)):
     events = get_audit_log()
     recent = events[-limit:]
     return SafetyAuditResponse(events=recent, count=len(events))
+
+
+# ── Injection Metrics (D-018d) ─────────────────────────────────────
+
+
+class InjectionMetricsResponse(BaseModel):
+    agent_id: str
+    days: int
+    total_logs: int = 0
+    injection_rate: float = 0.0
+    score_stats: dict = Field(default_factory=dict)
+    top_memories: list[dict] = Field(default_factory=list)
+
+
+@app.get("/injection/metrics", response_model=InjectionMetricsResponse)
+async def injection_metrics(
+    agent_id: str = Query(..., description="Agent ID"),
+    days: int = Query(default=7, ge=1, le=90),
+):
+    """Rolling w×s injection stats for empirical formula validation."""
+    pool = await get_pool()
+
+    # Stats + percentiles in one query
+    stats_row = await pool.fetchrow(
+        """
+        SELECT count(*) AS total,
+               count(*) FILTER (WHERE was_injected) AS injected,
+               avg(injection_score) AS avg_score,
+               percentile_cont(ARRAY[0.5, 0.75, 0.95])
+                 WITHIN GROUP (ORDER BY injection_score) AS pcts
+        FROM injection_logs
+        WHERE agent_id = $1
+          AND created_at >= NOW() - make_interval(days => $2)
+        """,
+        agent_id,
+        days,
+    )
+
+    total = stats_row["total"] or 0
+    injected = stats_row["injected"] or 0
+    pcts = stats_row["pcts"] or [0.0, 0.0, 0.0]
+
+    score_stats = {
+        "avg": round(float(stats_row["avg_score"] or 0), 4),
+        "p50": round(float(pcts[0]), 4),
+        "p75": round(float(pcts[1]), 4),
+        "p95": round(float(pcts[2]), 4),
+    }
+
+    # Top memories by injection count
+    top_rows = await pool.fetch(
+        """
+        SELECT memory_id, count(*) AS inj_count,
+               round(avg(injection_score)::numeric, 4) AS avg_score
+        FROM injection_logs
+        WHERE agent_id = $1
+          AND was_injected = true
+          AND created_at >= NOW() - make_interval(days => $2)
+        GROUP BY memory_id
+        ORDER BY inj_count DESC
+        LIMIT 10
+        """,
+        agent_id,
+        days,
+    )
+
+    return InjectionMetricsResponse(
+        agent_id=agent_id,
+        days=days,
+        total_logs=total,
+        injection_rate=round(injected / total, 4) if total > 0 else 0.0,
+        score_stats=score_stats,
+        top_memories=[
+            {"memory_id": r["memory_id"], "count": r["inj_count"],
+             "avg_score": float(r["avg_score"])}
+            for r in top_rows
+        ],
+    )
 
 
 # ── Bootstrap Readiness ─────────────────────────────────────────────

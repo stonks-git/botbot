@@ -173,3 +173,28 @@ CREATE TABLE IF NOT EXISTS dmn_log (
 
 CREATE INDEX IF NOT EXISTS idx_dmn_log_agent
     ON dmn_log (agent_id, created_at DESC);
+
+
+-- =============================================================================
+-- INJECTION LOGS — w×s identity injection decisions for analytics (D-018d)
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS injection_logs (
+    id              SERIAL      PRIMARY KEY,
+    agent_id        TEXT        NOT NULL,
+    memory_id       TEXT        NOT NULL,
+    weight_center   FLOAT       NOT NULL,
+    cosine_sim      FLOAT       NOT NULL,
+    injection_score FLOAT       NOT NULL,
+    was_injected    BOOLEAN     NOT NULL,
+    query_hash      TEXT        NOT NULL,
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_injection_logs_agent
+    ON injection_logs (agent_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_injection_logs_memory
+    ON injection_logs (memory_id);
+
+CREATE INDEX IF NOT EXISTS idx_injection_logs_query
+    ON injection_logs (query_hash);

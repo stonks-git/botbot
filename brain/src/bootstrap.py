@@ -39,10 +39,10 @@ class BootstrapReadiness:
         ("First Retrieval", "A memory has been retrieved (access_count > 0)"),
         ("First Consolidation", "Background consolidation has run"),
         ("Goal-Weight Promotion", "A memory reached center > 0.6 through reinforcement"),
-        ("First DMN Self-Prompt", "The idle loop produced a stored thought"),
+        ("First DMN Self-Prompt", "The idle loop produced a thought"),
         ("Identity-Weight Promotion", "A memory reached center > 0.8 through reinforcement"),
-        ("First Conflict Resolution", "A tension was detected and resolved"),
-        ("First Creative Association", "A creative insight emerged from association"),
+        ("First Conflict Detection", "A contradiction was detected between memories"),
+        ("First Creative Association", "A narrative emerged from memory pattern clustering"),
         ("First Goal Reflected", "A reflection about goals or achievement was stored"),
         ("Autonomous Decision", "Sufficient identity depth for autonomous operation"),
     ]
@@ -127,7 +127,7 @@ class BootstrapReadiness:
 
     async def _check_first_dmn_self_prompt(self, agent_id: str) -> bool:
         count = await self.pool.fetchval(
-            "SELECT COUNT(*) FROM memories WHERE agent_id = $1 AND source_tag = 'internal_dmn'",
+            "SELECT COUNT(*) FROM dmn_log WHERE agent_id = $1",
             agent_id,
         )
         return count > 0
@@ -146,23 +146,14 @@ class BootstrapReadiness:
 
     async def _check_conflict_resolution(self, agent_id: str) -> bool:
         count = await self.pool.fetchval(
-            """
-            SELECT COUNT(*) FROM memories
-            WHERE agent_id = $1
-              AND type = 'tension'
-              AND metadata->>'resolved' = 'true'
-            """,
+            "SELECT COUNT(*) FROM memories WHERE agent_id = $1 AND type = 'tension'",
             agent_id,
         )
         return count > 0
 
     async def _check_creative_association(self, agent_id: str) -> bool:
         count = await self.pool.fetchval(
-            """
-            SELECT COUNT(*) FROM memories
-            WHERE agent_id = $1
-              AND metadata ? 'creative_insight'
-            """,
+            "SELECT COUNT(*) FROM memories WHERE agent_id = $1 AND type = 'narrative'",
             agent_id,
         )
         return count > 0

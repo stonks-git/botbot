@@ -212,8 +212,10 @@ class ExitGate:
             relevance_axis = "irrelevant"
 
         # 3. Novelty axis: check_novelty + contradiction detection
+        #    Reuse content_embedding (same SEMANTIC_SIMILARITY task type) to avoid re-embed (CQ-010)
         is_novel, max_similarity, most_similar_id = await memory_store.check_novelty(
-            content, agent_id, threshold=cfg.confirming_sim
+            content, agent_id, threshold=cfg.confirming_sim,
+            embedding=content_embedding,
         )
 
         # Lightweight touch: refresh last_accessed to prevent decay (no access_count change)
@@ -224,15 +226,13 @@ class ExitGate:
                 pass  # Non-critical, don't fail the gate
 
         # Check for contradiction if similarity is in the right range
+        #   Fetch by ID instead of re-embedding + re-searching (CQ-010)
         contradiction_score = 0.0
-        if max_similarity >= cfg.contradiction_sim:
-            # Find the most similar memory to check for negation
-            similar = await memory_store.search_similar(
-                content, agent_id, top_k=1, min_similarity=cfg.contradiction_sim
-            )
-            if similar:
+        if max_similarity >= cfg.contradiction_sim and most_similar_id:
+            existing = await memory_store.get_memory(most_similar_id, agent_id)
+            if existing:
                 contradiction_score = detect_contradiction_negation(
-                    content, similar[0]["content"]
+                    content, existing["content"]
                 )
 
         # Classify novelty

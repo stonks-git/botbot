@@ -7,117 +7,85 @@
 
 ## Previous Sessions
 
-### SESSION 2026-02-22 (#17) - Identity Architecture Brainstorm
-
-**STATUS:** DONE (brainstorm only, no code changes)
-
-**What was done:**
-
-Extended brainstorm session revising the identity architecture (D-015/D-016/D-017 from Session 16) and creating new design decisions (D-018a-d, D-019, D-020, D-021).
-
-**Key architectural shifts:**
-
-1. **Dropped floor from identity scoring (DJ-005):** `injection_score = weight_center * cosine_sim` — no floor. Any floor creates immortal memories by guaranteeing injection → reinforcement regardless of relevance. Zero relevance = zero score.
-
-2. **Dropped core identity tier (DJ-006):** No protected "core" tier. Identity hash feature-flagged dormant. All non-immutable memories compete on w×s. Core values emerge from behavioral patterns detected by consolidation, not from designation. "Strong ego = rigid agent."
-
-3. **Consolidation spawns research sessions (DJ-007):** Instead of internal LLM fact-check, contradictions trigger a full agent session with web search tools. LLM judges worthiness first. 1/hour, max 24/day.
-
-4. **Adaptive context shift (D-018a):** P75 percentile of last 200 shift values. Self-evolving threshold. Active identity cached between subject changes.
-
-5. **Semantic chunking + memory groups (D-018b/c):** Gate enforces 300-token max. Long content chunked. Chunks linked by group_id. Group-wide beta refresh. Insights from single group share group_id.
-
-6. **3-tier injection analytics (D-018d):** injection_logs table. Real-time rolling metrics, daily batch analysis + behavioral classification, weekly anomaly detection.
-
-7. **Proactive notifications (D-019):** Urgency ≠ importance ≠ weight. Urgent → push NOW (Telegram/WhatsApp/webhook). Important → btw next chat. T-P11 added to roadmap.
-
-8. **AGENTS.md web search (D-020):** Brain memory trusted, LLM training data not. Max 3 searches/turn.
-
-9. **Pattern detection redesign (D-021):** HDBSCAN clustering, per-cluster LLM analysis, 1/day, 1-level recursion, weighted avg insights, dedup at sim>0.85, no cap.
-
-**Decisions:** D-015 (revised), D-016 (revised), D-017 (revised), D-018a, D-018b, D-018c, D-018d, D-019, D-020, D-021
-**Decision Journal:** DJ-005, DJ-006, DJ-007
-**New task:** T-P11 (proactive notification system)
-
-| File | What was done |
-|------|---------------|
-| `state/devlog.ndjson` | 17 new entries (decisions, DJ entries, kb_update, handoff) |
-| `state/handoff.md` | Session 17 summary, updated priorities |
-| `state/roadmap.json` | D-015/D-016/D-017 revised to accepted, D-018a-d/D-019/D-020/D-021 added, T-P11 added, meta updated |
-| `KB/KB_01_architecture.md` | Session 17 brainstorm section (full architecture summary), DJ-005/DJ-006/DJ-007 entries, DJ table updated |
-
----
-
-### SESSION 2026-02-22 (#18) - Idle-State Sustainability Fixes + Truncation Bug
+### SESSION 2026-02-22 (#26) - T-P13: Injection Logging + w×s Analytics (D-018d)
 
 **STATUS:** DONE
 
 **What was done:**
 
-1. **Diagnosed 5 problems from 4.5h runtime data:** Decay winning (beta +0.48/4hr), consolidation over-production (15 memories/hr, all decaying), DMN producing nothing (268 heartbeats, 0 thoughts), DNS transient failure, no conversation.
+1. **injection_logs table** — SERIAL PK, 8 columns (agent_id, memory_id, weight_center, cosine_sim, injection_score, was_injected, query_hash, created_at), 3 indexes (agent+time, memory_id, query_hash). No FK constraints (log table convention). `brain/src/schema.sql`.
 
-2. **Mapped brainstorm decisions to problems:** Only ~20% of observed problems covered by Session 17 brainstorm. Identified "idle-state sustainability" as new problem class.
+2. **Injection decision logging** — After w×s identity scoring loop in `assemble_context()`, every candidate is logged with derived weight_center (alpha/(alpha+beta)), cosine_sim (injection_score/weight_center), and was_injected flag. Batch INSERT via `pool.executemany()`. Non-blocking (try/except). query_hash = SHA-256[:16] of query_text for turn grouping. `brain/src/context_assembly.py`.
 
-3. **D-022: Decay interval 5min→1h (IMPLEMENTED):** `DECAY_TICK_INTERVAL = 3600`. Decay pressure drops from 0.12 to 0.01 beta/hr (12x reduction).
-
-4. **D-023: Consolidation dedup+reinforce (IMPLEMENTED):** All 4 creation paths (tensions, insights, narratives, revalidation) now call `check_novelty(threshold=0.85)`. If not novel, reinforces existing memory via `apply_retrieval_mutation` instead of creating new. DB analysis showed 49% of pool were near-exact duplicates (sim >= 0.95).
-
-5. **D-024: DMN cold-start fallback (IMPLEMENTED):** When all 4 channels return None (thresholds unreachable for young agent), `_sample_fallback` picks from ALL memories with probability proportional to weight center.
-
-6. **D-025: Insight weight inheritance (IMPLEMENTED):** `store_insight` computes weighted-avg alpha/beta from sources. Removed source importance demotion (`importance = LEAST(0.3)` deleted). Added `initial_alpha`/`initial_beta` params to `store_memory`.
-
-7. **BUG-001 FOUND: Gemini thinking model truncation.** `gemini-3-flash-preview` is a reasoning model — internal chain-of-thought consumes from `max_output_tokens` budget. With `max_tokens=200`, model spends ~180 on thinking, leaves ~20 for actual output. 101/109 memories are sentence fragments (14-50 chars). Root cause of all garbage consolidation output. Fix pending: disable thinking or raise budget.
-
-**Decisions:** D-022, D-023, D-024, D-025
-**Bugs found:** BUG-001 (Gemini thinking model token budget)
+3. **GET /injection/metrics endpoint** — SQL percentiles via `percentile_cont(ARRAY[0.5, 0.75, 0.95])`, injection_rate, top-10 memories by injection count. Time-filtered by `days` param (default 7). Graceful on empty table. `brain/src/api.py`.
 
 | File | What was done |
 |------|---------------|
-| `brain/src/consolidation.py` | D-022: decay interval 5min→1h. D-023: dedup+reinforce all 4 paths |
-| `brain/src/memory.py` | D-025: initial_alpha/beta on store_memory, weight inheritance in store_insight, removed source demotion |
-| `brain/src/idle.py` | D-024: _sample_fallback weight-proportional sampling |
-| `state/devlog.ndjson` | 9 entries (D-022-025, BUG-001, 4 feature implementations) |
-| `state/handoff.md` | Session 18 summary |
-| `KB/KB_01_architecture.md` | Updated consolidation, DMN, memory sections |
-| `state/roadmap.json` | Added D-022-D-025 |
+| `brain/src/schema.sql` | injection_logs table + 3 indexes |
+| `brain/src/context_assembly.py` | import hashlib, identity_candidates init, injection logging block after w×s loop |
+| `brain/src/api.py` | InjectionMetricsResponse model + GET /injection/metrics endpoint |
+| `state/plans/202602211500-identity-architecture-rework.md` | Phase 2 decomposed + all 3 tasks checked + DONE |
+| `KB/KB_01_architecture.md` | injection_logs table, injection logging in context assembly, /injection/metrics endpoint |
+| `state/devlog.ndjson` | 2 entries (feature + kb_update) |
+| `state/roadmap.json` | T-P13 → done |
 
----
-
-### SESSION 2026-02-21 (#19) - T-S18 Deploy + T-P9 AGENTS.md + T-P10 DMN Observability
+### SESSION 2026-02-22 (#25) - T-B05: DMN Channel Fix + Monologue Key + JSONB (CQ-025, CQ-023, CQ-014)
 
 **STATUS:** DONE
 
 **What was done:**
 
-1. **T-S18 Deploy (DB cleanup + restart + verify):**
-   - Deleted 100 junk consolidation memories (truncated fragments from BUG-001). Kept 1 legitimate 289-char narrative. Deleted 456 orphaned `memory_supersedes` rows.
-   - BUG-001 verified fixed (removed `max_output_tokens` cap).
-   - Rebuilt brain, verified 16 new full-length consolidation memories (124-369 chars).
+1. **CQ-025: DMN creative channel always wins.** `_classify_channel()` checked `len(activated) > 0` — any memory with even 1 co-access (score 0.05) triggered "DMN/creative", starving identity/reflect channels. Added `MIN_CREATIVE_ACTIVATION = 0.15` constant. Now requires `max(activated.values()) >= 0.15`, meaning ≥3 co-accesses at hop 0 for creative classification.
 
-2. **T-P9: AGENTS.md updates (D-020 + tag leak fix):**
-   - Added "Web Search (CRITICAL)" section: brain memory trusted, LLM training data not, max 3 searches/turn, verify facts from training knowledge.
-   - Added "Reply Tags (DO NOT OUTPUT)" section: never echo `[[reply_to_current]]` or `[[ ... ]]` directives.
-   - Synced `openclaw-workspace/AGENTS.md` → `openclaw-config/AGENTS.md`.
+2. **CQ-023: Monologue key mismatch.** `api.py` monologue endpoint read `ct.get("resolution_reason")` but `rumination.py` stores completed threads with key `"reason"`. Result: resolution_reason always `""`. Fixed to `ct.get("reason")`. API response field name preserved.
 
-3. **T-P10: DMN Observability:**
-   - Added `dmn_log` table to `schema.sql` (id, agent_id, thought, channel, source_memory_id, created_at + index).
-   - Modified `idle.py` `_queue_thought()` to INSERT into `dmn_log` after queueing (non-blocking, try/except wrapped).
-   - Added `GET /monologue/{agent_id}?limit=50` endpoint to `api.py`: unified reverse-chronological view combining dmn_log (thoughts), consolidation_log (operations), memories (tension/narrative/reflection), and rumination state (active thread + recent completed).
-   - Added `monologue` tool to OpenClaw plugin (`index.ts`): calls `/monologue/{agent_id}`, formats entries as timeline.
-   - Verified: endpoint returns unified view, dmn_log table persisting thoughts (16 rows within first minute).
+3. **CQ-014: JSONB double-serialization.** `_log_consolidation()` passed `json.dumps(details)` string to asyncpg for a JSONB column. asyncpg's default JSONB codec calls `json.dumps()` internally → double-serialized (JSON string literal stored instead of object). `details->>'key'` returned NULL, `isinstance(details, dict)` returned False. Fixed: pass dict directly. Removed unused `import json`.
 
 | File | What was done |
 |------|---------------|
-| `openclaw-workspace/AGENTS.md` | D-020 web search rules, reply tag leak fix |
-| `openclaw-config/AGENTS.md` | Synced with workspace |
-| `brain/src/schema.sql` | Added `dmn_log` table + index |
-| `brain/src/idle.py` | Persist thoughts to `dmn_log` on generation |
-| `brain/src/api.py` | Added `GET /monologue/{agent_id}` endpoint + response models |
-| `openclaw/extensions/memory-brain/index.ts` | Added `monologue` tool + `brainGetMonologue()` HTTP client |
-| `state/devlog.ndjson` | 6 entries (T-S18 deploy, T-P9, T-P10, KB update, verification, handoff) |
-| `state/handoff.md` | Session 19 expanded, tasks/blockers updated |
-| `state/roadmap.json` | T-S18→done, T-P9→done, T-P10→done |
-| `KB/KB_01_architecture.md` | Updated DMN (Phase 6) + OpenClaw runtime sections |
+| `brain/src/idle.py` | CQ-025: Added MIN_CREATIVE_ACTIVATION=0.15, changed _classify_channel creative check |
+| `brain/src/api.py` | CQ-023: Fixed monologue completed thread key from "resolution_reason" to "reason" |
+| `brain/src/consolidation.py` | CQ-014: Pass dict directly to asyncpg JSONB column, removed json import |
+| `KB/KB_01_architecture.md` | Updated _classify_channel, consolidation_log, monologue descriptions |
+| `state/devlog.ndjson` | 4 entries (3 bugfixes + kb_update) |
+| `state/roadmap.json` | T-B05 → done |
+
+### SESSION 2026-02-22 (#24) - T-B04: Batch Embedding + Gate Redundant Search (CQ-008, CQ-010)
+
+**STATUS:** DONE
+
+**What was done:**
+
+1. **CQ-008: True batch embedding.** Rewrote `embed_batch()` in memory.py to use Gemini's native batch API — passes `contents=[list]` to `embed_content()` in a single call per 100 texts, instead of N individual `embed()` calls via asyncio.gather. Retry logic (exponential backoff) preserved per chunk.
+
+2. **CQ-010: Gate triple-embed eliminated.** Added optional `embedding` parameter to `check_novelty()` — when provided, skips internal `embed()` call (backward compatible). `ExitGate.evaluate()` now: (a) embeds content once, (b) passes that embedding to `check_novelty()`, (c) fetches contradiction content via `get_memory(most_similar_id)` instead of re-embedding+re-searching via `search_similar()`. 3 embed API calls → 1 per gate evaluation.
+
+| File | What was done |
+|------|---------------|
+| `brain/src/memory.py` | CQ-008: Rewrote `embed_batch()` for true Gemini batch API. CQ-010: Added `embedding` param to `check_novelty()` |
+| `brain/src/gate.py` | CQ-010: Pass pre-computed embedding to check_novelty. Replace search_similar with get_memory for contradiction |
+| `KB/KB_01_architecture.md` | Updated memory method table, gate novelty description, dependency graph |
+| `state/devlog.ndjson` | 3 entries (2 bugfixes + kb_update) |
+| `state/roadmap.json` | T-B04 → done |
+
+### SESSION 2026-02-22 (#23) - T-P12: Identity w×s Scoring + Hash Feature Flag (D-015, D-017)
+
+**STATUS:** DONE
+
+**What was done:**
+
+1. **D-015: Replaced stochastic identity injection with w×s scoring.** Added `score_identity_wxs()` method to MemoryStore — computes `injection_score = weight_center × cosine_sim` entirely in SQL via pgvector `<=>` operator. Context assembly now embeds `query_text` (RETRIEVAL_QUERY task type), calls the scoring method, and injects identity memories ranked by injection_score within `BUDGET_IDENTITY_MAX`. No query = no identity injection (relevance mandatory per DJ-005). Removed stochastic Beta sampling, `_get_top_identity_memories` helper, `IDENTITY_THRESHOLD` constant, and `StochasticWeight` import.
+
+2. **D-017: Identity hash feature-flagged dormant.** Added `IDENTITY_HASH_ENABLED = False` constant. `render_identity_hash()` skipped during context assembly (saves ~100-200 tokens per call). API endpoints `GET /identity/{id}` and `GET /identity/{id}/hash` still functional. System prompt header renamed from `[IDENTITY -- active beliefs/values this cycle]` to `[ACTIVE IDENTITY]`.
+
+| File | What was done |
+|------|---------------|
+| `brain/src/memory.py` | D-015: Added `score_identity_wxs()` method — SQL-native w×s identity scoring |
+| `brain/src/context_assembly.py` | D-015: w×s identity injection loop. D-017: `IDENTITY_HASH_ENABLED=False`. Header → `[ACTIVE IDENTITY]`. Removed stochastic imports + dead helper |
+| `state/plans/202602211500-identity-architecture-rework.md` | Phase 1 decomposed + DONE. Plan status → active |
+| `KB/KB_01_architecture.md` | Updated Phase 3 context assembly description + dependency graph |
+| `state/devlog.ndjson` | 3 entries (2 features + kb_update) |
+| `state/roadmap.json` | T-P12 → done |
 
 ---
 
@@ -131,8 +99,13 @@ BotBot bolts the intuitive-AI cognitive architecture (memory with Beta-distribut
 
 | Task ID | Status |
 |---------|--------|
-| D-014 | TODO — DMN touch_memory (quick fix, deferred — D-024 fallback addresses cold start first) |
-| T-P11 | TODO — Proactive notification system (urgency/importance scoring + Telegram delivery) |
+| T-B01 | DONE — Critical bugs: dir(), N+1 retrieval mutation, N+1 co-access (CQ-001/002/003/004) |
+| T-B02 | DONE — Safety bypass in promotion + decay (CQ-005/006) |
+| T-B03 | DONE — Unreachable bootstrap milestones 5/7/8 (CQ-019) |
+| T-P12 | DONE — Identity w×s scoring + hash feature flag (D-015/D-017) |
+| T-B04 | DONE — True batch embedding + gate redundant search fix (CQ-008/CQ-010) |
+| T-B05 | DONE — DMN channel fix + monologue key + JSONB (CQ-025/CQ-023/CQ-014) |
+| T-P13 | DONE — Injection logging + w×s analytics (D-018d) |
 
 ## Blockers or open questions
 
@@ -157,8 +130,8 @@ BotBot bolts the intuitive-AI cognitive architecture (memory with Beta-distribut
 ## Git Status
 
 - **Branch:** main
-- **Last commit:** ef4031b Sessions 14-15: Gate hunger curve, plugin capture improvements, custom AGENTS.md
-- **Modified (tracked):** KB/KB_01_architecture.md, brain/src/api.py, brain/src/consolidation.py, brain/src/context_assembly.py, brain/src/gate.py, brain/src/idle.py, brain/src/llm.py, brain/src/memory.py, brain/src/schema.sql, openclaw-workspace/AGENTS.md, openclaw/extensions/memory-brain/index.ts, state/devlog.ndjson, state/handoff.md, state/roadmap.json
+- **Last commit:** ff18664 Sessions 18-19: Idle-state fixes, DB cleanup, AGENTS.md, DMN observability
+- **Modified (tracked):** KB/KB_01_architecture.md, brain/src/api.py, brain/src/bootstrap.py, brain/src/consolidation.py, brain/src/context_assembly.py, brain/src/gate.py, brain/src/idle.py, brain/src/memory.py, brain/src/relevance.py, brain/src/schema.sql, state/devlog.ndjson, state/handoff.md, state/roadmap.json
 - **New (untracked):** openclaw-workspace/.openclaw/, openclaw-workspace/BOOTSTRAP.md, etc.
 
 ---
@@ -166,7 +139,7 @@ BotBot bolts the intuitive-AI cognitive architecture (memory with Beta-distribut
 ## Memory Marker
 
 ```
-MEMORY_MARKER: 2026-02-21T22:30:00+02:00 | Session 19 complete (T-S18 deploy + T-P9 + T-P10) | DB cleanup, AGENTS.md updated (D-020 + tag leak), DMN observability (dmn_log table + /monologue endpoint + plugin tool). | Next: D-014 (DMN touch_memory), identity architecture rework (D-015/D-017/D-018a-d), T-P11 (notifications).
+MEMORY_MARKER: 2026-02-22T17:00:00+02:00 | Session 26 complete (T-P13: D-018d) | injection_logs table + context_assembly logging + /injection/metrics endpoint. Plan Phase 2 DONE. | Next: T-B06 (code hygiene), T-P11 (proactive notifications), T-P14 (semantic chunking).
 ```
 
 ---

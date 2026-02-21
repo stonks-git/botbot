@@ -30,6 +30,10 @@ BIAS_TENSION = 0.20
 BIAS_TEMPORAL = 0.20
 BIAS_INTROSPECTION = 0.25
 
+# Minimum spread-activation score to classify as creative (CQ-025)
+# At hop 0: score = co_access_count / 20.0, so 0.15 requires count >= 3
+MIN_CREATIVE_ACTIVATION = 0.15
+
 # Interval tiers (seconds)
 INTERVAL_POST_TASK = 60       # < 10 min idle
 INTERVAL_IDLE_10MIN = 300     # 10-60 min idle
@@ -195,10 +199,14 @@ class IdleLoop:
             result = await self._sample_introspective(agent_id)
 
         if result is not None:
+            await self._touch_sampled(agent_id, result)
             return result
 
         # Cold-start fallback: weight-proportional random sampling
-        return await self._sample_fallback(agent_id)
+        fallback = await self._sample_fallback(agent_id)
+        if fallback is not None:
+            await self._touch_sampled(agent_id, fallback)
+        return fallback
 
     async def _sample_fallback(self, agent_id: str) -> dict | None:
         """Pick from all memories with probability proportional to weight center."""
@@ -223,6 +231,20 @@ class IdleLoop:
             chosen["id"], float(chosen["center"]), agent_id,
         )
         return {"id": chosen["id"], "content": chosen["content"], "type": chosen["type"]}
+
+    async def _touch_sampled(self, agent_id: str, memory: dict) -> None:
+        """Touch sampled memory (+ tension partner) to prevent decay during rumination (D-014)."""
+        memory_id = memory.get("id")
+        if not memory_id:
+            return
+        try:
+            await self.memory_store.touch_memory(memory_id, agent_id)
+            # Tension channel may also sample a partner
+            partner_id = memory.get("partner_id")
+            if partner_id:
+                await self.memory_store.touch_memory(partner_id, agent_id)
+        except Exception as e:
+            logger.warning("Failed to touch sampled memory %s: %s", memory_id, e)
 
     async def _sample_neglected(self, agent_id: str) -> dict | None:
         """High-weight memories not accessed in 7+ days."""
@@ -363,7 +385,7 @@ class IdleLoop:
             activated = await spread_activation(
                 self.pool, [memory_id], agent_id, hops=2,
             )
-            if len(activated) > 0:
+            if activated and max(activated.values()) >= MIN_CREATIVE_ACTIVATION:
                 return "DMN/creative"
         except Exception:
             pass  # co-access table may be empty

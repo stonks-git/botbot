@@ -2,18 +2,19 @@
 
 Builds a structured system prompt from:
   Track 0: immutable safety memories (always present)
-  Identity hash: compact summary from top unified memories (always present)
-  Track 2: stochastic identity memories (Beta-sampled from top-N by depth_weight)
+  Active identity: w×s scored memories (D-015 — weight_center × cosine_sim)
   Track 1: situational memories (hybrid search within budget)
 
 D-005: Identity is the weights. No L0/L1 layers — identity emerges from
 high-weight memories in the unified table.
+D-015/DJ-005: injection_score = weight_center × cosine_sim. No floor.
+D-017/DJ-006: Identity hash feature-flagged dormant.
 """
 
+import hashlib
 import logging
 
 from .activation import cosine_similarity
-from .stochastic import StochasticWeight
 
 logger = logging.getLogger("brain.context")
 
@@ -26,8 +27,10 @@ BUDGET_COGNITIVE_STATE = 200
 BUDGET_ATTENTION_FIELD = 500
 BUDGET_OUTPUT_BUFFER = 4000
 
-IDENTITY_THRESHOLD = 0.6
 IDENTITY_TOP_N = 20
+
+# Identity hash feature flag (D-017/DJ-006: dormant)
+IDENTITY_HASH_ENABLED = False
 
 # Identity render constants
 IDENTITY_HASH_TOP_N = 10
@@ -70,32 +73,61 @@ async def assemble_context(
         parts["immutable"].append(mem["content"])
         used_tokens += _estimate_tokens(mem["content"])
 
-    # Identity hash (compact, always present — rendered from top DB memories)
-    identity_hash = await render_identity_hash(memory_store, agent_id)
-    parts["identity_hash"] = identity_hash
-    used_tokens += _estimate_tokens(identity_hash)
+    # Identity hash (D-017: feature-flagged dormant)
+    if IDENTITY_HASH_ENABLED:
+        identity_hash = await render_identity_hash(memory_store, agent_id)
+        parts["identity_hash"] = identity_hash
+        used_tokens += _estimate_tokens(identity_hash)
 
-    # Track 2: stochastic identity injection
+    # Active identity: w×s scored memories (D-015)
     identity_tokens = 0
-    identity_memories = await _get_top_identity_memories(
-        memory_store, agent_id, IDENTITY_TOP_N
-    )
-    for mem in identity_memories:
-        if identity_tokens >= BUDGET_IDENTITY_MAX:
-            break
-        weight = StochasticWeight(
-            alpha=mem.get("depth_weight_alpha", 1.0),
-            beta=mem.get("depth_weight_beta", 4.0),
-        )
-        if weight.observe() > IDENTITY_THRESHOLD or mem.get("immutable", False):
+    identity_candidates = []
+    if query_text:
+        try:
+            query_vec = await memory_store.embed(
+                query_text, task_type="RETRIEVAL_QUERY"
+            )
+            identity_candidates = await memory_store.score_identity_wxs(
+                query_vec, agent_id, IDENTITY_TOP_N
+            )
+        except RuntimeError:
+            identity_candidates = []
+        for mem in identity_candidates:
+            if identity_tokens >= BUDGET_IDENTITY_MAX:
+                break
             content = mem["content"]
             tokens = _estimate_tokens(content)
             if identity_tokens + tokens <= BUDGET_IDENTITY_MAX:
                 parts["identity_memories"].append(content)
                 identity_tokens += tokens
-                if not mem.get("immutable", False):
-                    injected_memory_ids.append(mem["id"])
+                injected_memory_ids.append(mem["id"])
     used_tokens += identity_tokens
+
+    # Log injection decisions (D-018d) — non-blocking
+    if identity_candidates:
+        try:
+            injected_set = set(injected_memory_ids)
+            query_hash = hashlib.sha256(query_text.encode()).hexdigest()[:16]
+            log_rows = []
+            for mem in identity_candidates:
+                alpha = mem["depth_weight_alpha"]
+                beta = mem["depth_weight_beta"]
+                wc = alpha / (alpha + beta) if (alpha + beta) > 0 else 0.0
+                cs = mem["injection_score"] / wc if wc > 0 else 0.0
+                log_rows.append((
+                    agent_id, mem["id"], wc, cs,
+                    mem["injection_score"], mem["id"] in injected_set,
+                    query_hash,
+                ))
+            await memory_store.pool.executemany(
+                """INSERT INTO injection_logs
+                   (agent_id, memory_id, weight_center, cosine_sim,
+                    injection_score, was_injected, query_hash)
+                   VALUES ($1, $2, $3, $4, $5, $6, $7)""",
+                log_rows,
+            )
+        except Exception:
+            logger.warning("Injection logging failed for %s", agent_id)
 
     # Cognitive state
     if cognitive_state_report:
@@ -151,7 +183,7 @@ def render_system_prompt(context: dict) -> str:
         sections.append("")
 
     if context["parts"]["identity_memories"]:
-        sections.append("[IDENTITY -- active beliefs/values this cycle]")
+        sections.append("[ACTIVE IDENTITY]")
         sections.extend(context["parts"]["identity_memories"])
         sections.append("")
 
@@ -322,25 +354,6 @@ async def _get_immutable_memories(memory_store, agent_id: str) -> list[dict]:
     rows = await memory_store.pool.fetch(
         "SELECT id, content FROM memories WHERE agent_id = $1 AND immutable = true",
         agent_id,
-    )
-    return [dict(r) for r in rows]
-
-
-async def _get_top_identity_memories(
-    memory_store, agent_id: str, top_n: int
-) -> list[dict]:
-    """Fetch top-N memories by depth_weight center (> 0.3)."""
-    rows = await memory_store.pool.fetch(
-        """
-        SELECT id, content, depth_weight_alpha, depth_weight_beta, immutable
-        FROM memories
-        WHERE agent_id = $1
-          AND depth_weight_alpha / (depth_weight_alpha + depth_weight_beta) > 0.3
-        ORDER BY depth_weight_alpha / (depth_weight_alpha + depth_weight_beta) DESC
-        LIMIT $2
-        """,
-        agent_id,
-        top_n,
     )
     return [dict(r) for r in rows]
 
