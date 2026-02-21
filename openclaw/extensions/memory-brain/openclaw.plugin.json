@@ -1,0 +1,36 @@
+{
+  "id": "memory-brain",
+  "kind": "memory",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "brainUrl": {
+        "type": "string",
+        "description": "Brain service URL (default: http://brain:8400)"
+      },
+      "agentId": {
+        "type": "string",
+        "description": "Agent ID for memory namespacing (default: from ctx or 'default')"
+      },
+      "autoRecall": {
+        "type": "boolean",
+        "description": "Auto-inject relevant memories before agent starts (default: true)"
+      },
+      "autoCapture": {
+        "type": "boolean",
+        "description": "Auto-capture user messages after agent ends (default: true)"
+      },
+      "recallLimit": {
+        "type": "number",
+        "description": "Max memories to inject on auto-recall (default: 5)"
+      },
+      "captureMaxChars": {
+        "type": "number",
+        "minimum": 10,
+        "maximum": 10000,
+        "description": "Max message length for auto-capture (default: 500)"
+      }
+    }
+  }
+}
