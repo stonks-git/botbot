@@ -406,6 +406,43 @@ async function brainGetDMNStatus(
   }
 }
 
+interface MonologueEntry {
+  ts: string;
+  type: string;
+  content: string;
+  channel?: string;
+  operation?: string;
+  source_memory_id?: string;
+  memory_id?: string;
+  details?: Record<string, unknown>;
+}
+
+interface MonologueResult {
+  agent_id: string;
+  entries: MonologueEntry[];
+  rumination: {
+    active?: Record<string, unknown>;
+    recent_completed?: Record<string, unknown>[];
+  };
+}
+
+async function brainGetMonologue(
+  baseUrl: string,
+  agentId: string,
+  limit = 30,
+): Promise<MonologueResult | null> {
+  try {
+    const resp = await brainFetch(
+      baseUrl,
+      `/monologue/${encodeURIComponent(agentId)}?limit=${limit}`,
+    );
+    if (!resp.ok) return null;
+    return (await resp.json()) as MonologueResult;
+  } catch {
+    return null;
+  }
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 const MEMORY_TYPES = [
@@ -941,6 +978,62 @@ const memoryBrainPlugin = {
         },
       },
       { name: "dmn_status" },
+    );
+
+    api.registerTool(
+      {
+        name: "monologue",
+        label: "Inner Monologue",
+        description:
+          "View your recent inner monologue: DMN thoughts, consolidation insights, " +
+          "tension detections, rumination threads. Use this to understand what you've " +
+          "been thinking about in the background.",
+        parameters: Type.Object({
+          limit: Type.Optional(
+            Type.Number({
+              description: "Max entries to return (default 30)",
+              minimum: 1,
+              maximum: 100,
+            }),
+          ),
+        }),
+        async execute(_toolCallId, params: { limit?: number }) {
+          const result = await brainGetMonologue(
+            cfg.brainUrl,
+            cfg.agentId,
+            params.limit ?? 30,
+          );
+          if (!result) {
+            return {
+              content: [{ type: "text", text: "Monologue unavailable." }],
+              details: { error: "unreachable" },
+            };
+          }
+          const lines: string[] = [];
+          for (const e of result.entries) {
+            const label =
+              e.type === "thought"
+                ? `[${e.channel ?? "DMN"}]`
+                : `[${e.type}${e.operation ? "/" + e.operation : ""}]`;
+            lines.push(`${e.ts} ${label} ${e.content}`);
+          }
+          if (result.rumination.active) {
+            const a = result.rumination.active;
+            lines.push(
+              `\n--- Active rumination ---\nTopic: ${a.topic}\nCycles: ${a.cycle_count}`,
+            );
+          }
+          const text =
+            lines.length > 0
+              ? lines.join("\n")
+              : "No inner monologue entries yet.";
+          return {
+            content: [{ type: "text", text }],
+            details: result,
+          };
+        },
+      },
+      { name: "monologue" },
     );
 
     // ====================================================================

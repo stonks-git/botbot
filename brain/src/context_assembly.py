@@ -55,6 +55,7 @@ async def assemble_context(
     identity_token_count, context_shift, inertia.
     """
     used_tokens = 0
+    injected_memory_ids: list[str] = []
     parts: dict = {
         "immutable": [],
         "identity_hash": "",
@@ -92,6 +93,8 @@ async def assemble_context(
             if identity_tokens + tokens <= BUDGET_IDENTITY_MAX:
                 parts["identity_memories"].append(content)
                 identity_tokens += tokens
+                if not mem.get("immutable", False):
+                    injected_memory_ids.append(mem["id"])
     used_tokens += identity_tokens
 
     # Cognitive state
@@ -108,6 +111,8 @@ async def assemble_context(
         )
         for mem in situational:
             parts["situational"].append(mem.get("compressed") or mem["content"])
+            if mem.get("id"):
+                injected_memory_ids.append(mem["id"])
     used_tokens += sum(_estimate_tokens(s) for s in parts["situational"])
 
     # Context inertia (Phase 4 wires attention embeddings)
@@ -127,6 +132,7 @@ async def assemble_context(
         "identity_token_count": identity_tokens,
         "context_shift": context_shift,
         "inertia": inertia,
+        "injected_memory_ids": injected_memory_ids,
     }
 
 

@@ -157,3 +157,19 @@ CREATE TABLE IF NOT EXISTS consolidation_log (
 
 CREATE INDEX IF NOT EXISTS idx_consolidation_agent
     ON consolidation_log (agent_id, created_at DESC);
+
+
+-- =============================================================================
+-- DMN LOG — Persisted DMN thoughts for observability
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS dmn_log (
+    id                  SERIAL      PRIMARY KEY,
+    agent_id            TEXT        NOT NULL,
+    thought             TEXT        NOT NULL,
+    channel             TEXT        NOT NULL,
+    source_memory_id    TEXT,
+    created_at          TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_dmn_log_agent
+    ON dmn_log (agent_id, created_at DESC);

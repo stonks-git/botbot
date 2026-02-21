@@ -181,17 +181,48 @@ class IdleLoop:
     # ── Sampling channels ────────────────────────────────────────────
 
     async def _sample_memory(self, agent_id: str) -> dict | None:
-        """Roll a channel and sample a memory from it."""
+        """Roll a channel and sample a memory from it. Falls back to
+        weight-proportional sampling when all channels return None."""
         roll = random.random()
 
         if roll < BIAS_NEGLECTED:
-            return await self._sample_neglected(agent_id)
+            result = await self._sample_neglected(agent_id)
         elif roll < BIAS_NEGLECTED + BIAS_TENSION:
-            return await self._sample_tension(agent_id)
+            result = await self._sample_tension(agent_id)
         elif roll < BIAS_NEGLECTED + BIAS_TENSION + BIAS_TEMPORAL:
-            return await self._sample_temporal(agent_id)
+            result = await self._sample_temporal(agent_id)
         else:
-            return await self._sample_introspective(agent_id)
+            result = await self._sample_introspective(agent_id)
+
+        if result is not None:
+            return result
+
+        # Cold-start fallback: weight-proportional random sampling
+        return await self._sample_fallback(agent_id)
+
+    async def _sample_fallback(self, agent_id: str) -> dict | None:
+        """Pick from all memories with probability proportional to weight center."""
+        rows = await self.pool.fetch(
+            """
+            SELECT id, content, type,
+                   depth_weight_alpha / (depth_weight_alpha + depth_weight_beta) AS center
+            FROM memories
+            WHERE agent_id = $1
+              AND embedding IS NOT NULL
+              AND NOT immutable
+            """,
+            agent_id,
+        )
+        if not rows:
+            return None
+
+        weights = [max(float(r["center"]), 0.01) for r in rows]  # floor to avoid zero-weight
+        chosen = random.choices(rows, weights=weights, k=1)[0]
+        logger.debug(
+            "Fallback channel sampled memory %s (center=%.3f) for %s",
+            chosen["id"], float(chosen["center"]), agent_id,
+        )
+        return {"id": chosen["id"], "content": chosen["content"], "type": chosen["type"]}
 
     async def _sample_neglected(self, agent_id: str) -> dict | None:
         """High-weight memories not accessed in 7+ days."""
@@ -419,6 +450,21 @@ class IdleLoop:
             memory_id=memory_id,
         )
         self.thought_queue.put_thought(agent_id, candidate)
+
+        # Persist to dmn_log for observability
+        try:
+            await self.pool.execute(
+                """
+                INSERT INTO dmn_log (agent_id, thought, channel, source_memory_id)
+                VALUES ($1, $2, $3, $4)
+                """,
+                agent_id,
+                thought,
+                channel,
+                memory_id,
+            )
+        except Exception as e:
+            logger.warning("Failed to persist DMN thought: %s", e)
 
         # Track for repetition detection
         if agent_id not in self._recent_topics:

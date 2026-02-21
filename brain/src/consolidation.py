@@ -25,7 +25,7 @@ from .memory import MemoryStore
 logger = logging.getLogger("brain.consolidation")
 
 # -- Tier 1 Constants --
-DECAY_TICK_INTERVAL = 300  # 5 min
+DECAY_TICK_INTERVAL = 3600  # 1 hour
 CONTRADICTION_SCAN_INTERVAL = 600  # 10 min
 PATTERN_DETECT_INTERVAL = 900  # 15 min
 CONSTANT_LOOP_INTERVAL = 30  # main loop sleep
@@ -238,17 +238,28 @@ class ConstantConsolidation:
                 response = await retry_llm_call(prompt, max_tokens=100, temperature=0.1)
 
                 if response.strip().upper() != "NO":
-                    await self.store.store_memory(
-                        content=f"Tension: {response}",
-                        agent_id=agent_id,
-                        memory_type="tension",
-                        source="consolidation",
-                        importance=0.6,
-                        metadata={
-                            "source_a": mem_a["id"],
-                            "source_b": mem_b["id"],
-                        },
+                    tension_content = f"Tension: {response}"
+                    is_novel, sim, existing_id = await self.store.check_novelty(
+                        tension_content, agent_id, threshold=MERGE_SIMILARITY_THRESHOLD
                     )
+                    if not is_novel and existing_id:
+                        await self.store.apply_retrieval_mutation([existing_id], agent_id)
+                        logger.info(
+                            "Tension reinforced existing %s (sim=%.3f) [%s]",
+                            existing_id, sim, agent_id,
+                        )
+                    else:
+                        await self.store.store_memory(
+                            content=tension_content,
+                            agent_id=agent_id,
+                            memory_type="tension",
+                            source="consolidation",
+                            importance=0.6,
+                            metadata={
+                                "source_a": mem_a["id"],
+                                "source_b": mem_b["id"],
+                            },
+                        )
                     tensions_found += 1
                     logger.info(
                         "Contradiction found [%s]: %s vs %s",
@@ -506,8 +517,8 @@ class DeepConsolidation:
                 for insight in insights:
                     if not insight or len(insight) < 10:
                         continue
-                    is_novel, _sim = await self.store.check_novelty(
-                        insight, agent_id, threshold=0.85
+                    is_novel, sim, existing_id = await self.store.check_novelty(
+                        insight, agent_id, threshold=MERGE_SIMILARITY_THRESHOLD
                     )
                     if is_novel:
                         await self.store.store_insight(
@@ -518,6 +529,13 @@ class DeepConsolidation:
                             metadata={"question": question, "phase": "merge_and_insight"},
                         )
                         insights_stored += 1
+                    elif existing_id:
+                        await self.store.apply_retrieval_mutation([existing_id], agent_id)
+                        logger.info(
+                            "Insight reinforced existing %s (sim=%.3f) [%s]",
+                            existing_id, sim, agent_id,
+                        )
+                        insights_skipped += 1
                     else:
                         insights_skipped += 1
             except Exception as e:
@@ -591,14 +609,24 @@ class DeepConsolidation:
                     prompt, max_tokens=200, temperature=0.4
                 )
                 if narrative and len(narrative) > 10:
-                    await self.store.store_memory(
-                        content=narrative,
-                        agent_id=agent_id,
-                        memory_type="narrative",
-                        source="consolidation",
-                        importance=0.7,
-                        metadata={"cluster_member_ids": cluster_ids},
+                    is_novel, sim, existing_id = await self.store.check_novelty(
+                        narrative, agent_id, threshold=MERGE_SIMILARITY_THRESHOLD
                     )
+                    if not is_novel and existing_id:
+                        await self.store.apply_retrieval_mutation([existing_id], agent_id)
+                        logger.info(
+                            "Narrative reinforced existing %s (sim=%.3f) [%s]",
+                            existing_id, sim, agent_id,
+                        )
+                    else:
+                        await self.store.store_memory(
+                            content=narrative,
+                            agent_id=agent_id,
+                            memory_type="narrative",
+                            source="consolidation",
+                            importance=0.7,
+                            metadata={"cluster_member_ids": cluster_ids},
+                        )
                     narratives += 1
             except Exception as e:
                 logger.warning("Narrative generation failed: %s", e)
@@ -753,16 +781,26 @@ class DeepConsolidation:
                 insights_revalidated += 1
 
                 if response.strip().upper() != "UNCHANGED":
-                    # Store updated insight linked to same sources
-                    source_ids = [s["id"] for s in sources]
-                    await self.store.store_insight(
-                        content=response,
-                        agent_id=agent_id,
-                        source_memory_ids=source_ids,
-                        importance=0.8,
-                        metadata={"phase": "revalidation", "replaces": insight_row["id"]},
+                    is_novel, sim, existing_id = await self.store.check_novelty(
+                        response, agent_id, threshold=MERGE_SIMILARITY_THRESHOLD
                     )
-                    # Weaken old insight
+                    if not is_novel and existing_id:
+                        await self.store.apply_retrieval_mutation([existing_id], agent_id)
+                        logger.info(
+                            "Revalidation reinforced existing %s (sim=%.3f) [%s]",
+                            existing_id, sim, agent_id,
+                        )
+                    else:
+                        # Store updated insight linked to same sources
+                        source_ids = [s["id"] for s in sources]
+                        await self.store.store_insight(
+                            content=response,
+                            agent_id=agent_id,
+                            source_memory_ids=source_ids,
+                            importance=0.8,
+                            metadata={"phase": "revalidation", "replaces": insight_row["id"]},
+                        )
+                    # Weaken old insight (superseded regardless)
                     await self.pool.execute(
                         """
                         UPDATE memories

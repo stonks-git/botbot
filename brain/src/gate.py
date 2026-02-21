@@ -212,9 +212,16 @@ class ExitGate:
             relevance_axis = "irrelevant"
 
         # 3. Novelty axis: check_novelty + contradiction detection
-        is_novel, max_similarity = await memory_store.check_novelty(
+        is_novel, max_similarity, most_similar_id = await memory_store.check_novelty(
             content, agent_id, threshold=cfg.confirming_sim
         )
+
+        # Lightweight touch: refresh last_accessed to prevent decay (no access_count change)
+        if most_similar_id:
+            try:
+                await memory_store.touch_memory(most_similar_id, agent_id)
+            except Exception:
+                pass  # Non-critical, don't fail the gate
 
         # Check for contradiction if similarity is in the right range
         contradiction_score = 0.0

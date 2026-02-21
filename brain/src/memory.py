@@ -108,6 +108,8 @@ class MemoryStore:
         evidence_count: int = 0,
         metadata: dict | None = None,
         source_tag: str | None = None,
+        initial_alpha: float | None = None,
+        initial_beta: float | None = None,
     ) -> str:
         mem_id = self._gen_id()
         prefixed = self.prefixed_content(content, memory_type)
@@ -118,10 +120,12 @@ class MemoryStore:
             """
             INSERT INTO memories (
                 id, agent_id, content, type, embedding, created_at, updated_at,
-                source, tags, confidence, importance, evidence_count, metadata, source_tag
+                source, tags, confidence, importance, evidence_count, metadata, source_tag,
+                depth_weight_alpha, depth_weight_beta
             ) VALUES (
                 $1, $2, $3, $4, $5::halfvec, $6, $7,
-                $8, $9, $10, $11, $12, $13, $14
+                $8, $9, $10, $11, $12, $13, $14,
+                $15, $16
             )
             """,
             mem_id,
@@ -138,6 +142,8 @@ class MemoryStore:
             evidence_count,
             json.dumps(metadata or {}),
             source_tag or "external_user",
+            initial_alpha if initial_alpha is not None else 1.0,
+            initial_beta if initial_beta is not None else 4.0,
         )
         logger.info("Stored memory %s (type=%s, agent=%s)", mem_id, memory_type, agent_id)
         return mem_id
@@ -151,7 +157,37 @@ class MemoryStore:
         tags: list[str] | None = None,
         metadata: dict | None = None,
     ) -> str:
-        """Store a consolidation insight and link to source memories."""
+        """Store a consolidation insight and link to source memories.
+
+        Inherits weighted-average alpha/beta from source memories (heavy sources
+        skew more). Does NOT demote source importance — sources keep their weight
+        until the insight proves itself through retrieval.
+        """
+        # Compute inherited weights from sources
+        initial_alpha = 1.0
+        initial_beta = 4.0
+        if source_memory_ids:
+            rows = await self.pool.fetch(
+                """
+                SELECT depth_weight_alpha, depth_weight_beta,
+                       depth_weight_alpha / (depth_weight_alpha + depth_weight_beta) AS center
+                FROM memories
+                WHERE id = ANY($1) AND agent_id = $2
+                """,
+                source_memory_ids,
+                agent_id,
+            )
+            if rows:
+                # Weighted average by center (heavy sources skew more)
+                total_weight = sum(float(r["center"]) for r in rows)
+                if total_weight > 0:
+                    initial_alpha = sum(
+                        float(r["depth_weight_alpha"]) * float(r["center"]) for r in rows
+                    ) / total_weight
+                    initial_beta = sum(
+                        float(r["depth_weight_beta"]) * float(r["center"]) for r in rows
+                    ) / total_weight
+
         mem_id = await self.store_memory(
             content,
             agent_id,
@@ -160,6 +196,8 @@ class MemoryStore:
             tags=tags,
             importance=importance,
             metadata=metadata,
+            initial_alpha=initial_alpha,
+            initial_beta=initial_beta,
         )
         for src_id in source_memory_ids:
             await self.pool.execute(
@@ -169,15 +207,6 @@ class MemoryStore:
                 """,
                 mem_id,
                 src_id,
-                agent_id,
-            )
-        if source_memory_ids:
-            await self.pool.execute(
-                """
-                UPDATE memories SET importance = LEAST(importance, 0.3)
-                WHERE id = ANY($1) AND agent_id = $2
-                """,
-                source_memory_ids,
                 agent_id,
             )
         return mem_id
@@ -412,8 +441,25 @@ class MemoryStore:
         """Retrieval-induced strengthening/weakening of memory weights."""
         now = datetime.now(timezone.utc)
         for mem_id in retrieved_ids:
+            # Always increment access_count (factual counter, not subject to safety)
+            await self.pool.execute(
+                """
+                UPDATE memories
+                SET access_count = access_count + 1,
+                    last_accessed = $1,
+                    access_timestamps = array_append(
+                        COALESCE(access_timestamps, ARRAY[]::timestamptz[]), $1
+                    ),
+                    updated_at = $1
+                WHERE id = $2 AND agent_id = $3 AND NOT immutable
+                """,
+                now,
+                mem_id,
+                agent_id,
+            )
+
+            # Alpha boost is subject to safety checks
             gain = 0.1
-            # Dormant memories with high vector score get extra reinforcement
             if vector_scores and vector_scores.get(mem_id, 0) > 0.9:
                 mem = await self.get_memory(mem_id, agent_id)
                 if mem and mem.get("access_count", 0) == 0:
@@ -433,18 +479,13 @@ class MemoryStore:
             await self.pool.execute(
                 """
                 UPDATE memories
-                SET access_count = access_count + 1,
-                    last_accessed = $1,
-                    access_timestamps = array_append(
-                        COALESCE(access_timestamps, ARRAY[]::timestamptz[]), $1
-                    ),
-                    depth_weight_alpha = depth_weight_alpha + $3,
+                SET depth_weight_alpha = depth_weight_alpha + $2,
                     updated_at = $1
-                WHERE id = $2 AND agent_id = $4
+                WHERE id = $3 AND agent_id = $4 AND NOT immutable
                 """,
                 now,
-                mem_id,
                 gain,
+                mem_id,
                 agent_id,
             )
 
@@ -469,6 +510,28 @@ class MemoryStore:
                     mem_id,
                     agent_id,
                 )
+
+    async def touch_memory(
+        self,
+        memory_id: str,
+        agent_id: str,
+    ) -> None:
+        """Refresh last_accessed without incrementing access_count.
+
+        Used by gate novelty check — prevents decay for 24h
+        but doesn't count as a real retrieval.
+        """
+        now = datetime.now(timezone.utc)
+        await self.pool.execute(
+            """
+            UPDATE memories
+            SET last_accessed = $1, updated_at = $1
+            WHERE id = $2 AND agent_id = $3 AND NOT immutable
+            """,
+            now,
+            memory_id,
+            agent_id,
+        )
 
     # ── Scratch buffer ─────────────────────────────────────────────────
 
@@ -528,12 +591,15 @@ class MemoryStore:
         content: str,
         agent_id: str,
         threshold: float = 0.85,
-    ) -> tuple[bool, float]:
-        """Check if content is novel compared to existing memories."""
+    ) -> tuple[bool, float, str | None]:
+        """Check if content is novel compared to existing memories.
+
+        Returns (is_novel, max_similarity, most_similar_id).
+        """
         vec = await self.embed(content, task_type="SEMANTIC_SIMILARITY")
         row = await self.pool.fetchrow(
             """
-            SELECT 1 - (embedding <=> $1::halfvec) AS similarity
+            SELECT id, 1 - (embedding <=> $1::halfvec) AS similarity
             FROM memories
             WHERE agent_id = $2
             ORDER BY embedding <=> $1::halfvec
@@ -543,9 +609,9 @@ class MemoryStore:
             agent_id,
         )
         if not row:
-            return True, 0.0
+            return True, 0.0, None
         max_sim = row["similarity"]
-        return max_sim < threshold, max_sim
+        return max_sim < threshold, max_sim, row["id"]
 
     async def get_stale_memories(
         self,

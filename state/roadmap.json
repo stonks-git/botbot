@@ -1,8 +1,8 @@
 {
   "meta": {
     "status": "active",
-    "last_updated": "2026-02-21",
-    "session": 10
+    "last_updated": "2026-02-22",
+    "session": 19
   },
   "open_questions": [
     {"id": "Q-001", "question": "GOOGLE_API_KEY .env setup for embedding testing", "blocking": ["T-P1"], "status": "answered"}
@@ -31,6 +31,91 @@
     {
       "id": "D-005",
       "summary": "Unified memory: discard L0/L1 layers, identity emerges from Beta weights in unified table. See KB/blueprints/v0.2_unified_memory_rework.md",
+      "status": "accepted"
+    },
+    {
+      "id": "D-012",
+      "summary": "Two mutation types: access_count+alpha for context injection, last_accessed refresh for gate touch. See DJ-004.",
+      "status": "accepted"
+    },
+    {
+      "id": "D-013",
+      "summary": "Separated access_count from alpha boost in apply_retrieval_mutation(). Safety can't block counting. See DJ-004.",
+      "status": "accepted"
+    },
+    {
+      "id": "D-014",
+      "summary": "DMN daydreaming should call touch_memory() on sampled memories to refresh 24h non-decay window. Idle agent forgets everything without this.",
+      "status": "accepted"
+    },
+    {
+      "id": "D-015",
+      "summary": "Identity injection: injection_score = weight_center * cosine_sim. No floor. All non-immutable memories vector-scored. Zero relevance = zero score. Log all w×s interactions. See DJ-005.",
+      "status": "accepted"
+    },
+    {
+      "id": "D-016",
+      "summary": "Consolidation research: contradiction → LLM classifies (factual/subjective, confidence>0.7) → spawn agent research session with web search. 1/hour, 24/day max. Highest single weight priority. Skip both<0.3. HIGH confidence to displace. See DJ-007.",
+      "status": "accepted"
+    },
+    {
+      "id": "D-017",
+      "summary": "No core identity tier. Identity hash dormant (feature-flagged off). System prompt = immutables + w×s scored memories. Core values emerge from behavioral patterns via consolidation insights. See DJ-006.",
+      "status": "accepted"
+    },
+    {
+      "id": "D-018a",
+      "summary": "Adaptive context shift: active identity cached, recomputed when context_shift > P75 of last 200 values. Self-evolving threshold. Bootstrap default 0.5.",
+      "status": "accepted"
+    },
+    {
+      "id": "D-018b",
+      "summary": "Full memory injection, no truncation. Gate enforces max ~300 tokens per memory via semantic chunking at storage time. Token budget limits count, not content.",
+      "status": "accepted"
+    },
+    {
+      "id": "D-018c",
+      "summary": "Memory groups: chunks linked by memory_group_id. Group-wide beta refresh on any member access. Insights from single group share group_id. Agent sees group metadata. No merging.",
+      "status": "accepted"
+    },
+    {
+      "id": "D-018d",
+      "summary": "w×s interaction logging: injection_logs DB table + 3-tier analysis (real-time metrics, daily batch+behavioral classification, weekly anomaly detection). Full context logged for formula evaluation.",
+      "status": "accepted"
+    },
+    {
+      "id": "D-019",
+      "summary": "Proactive notifications: urgency (time-sensitive, push NOW) ≠ importance (content significance, btw next chat) ≠ weight. notification_outbox + delivery worker + Telegram/WhatsApp/webhook channels. Quiet hours.",
+      "status": "accepted"
+    },
+    {
+      "id": "D-020",
+      "summary": "AGENTS.md web search rule: brain memory trusted, LLM training data NOT trusted. Agent must verify training-data facts via web search. Rate limit 3 searches/turn.",
+      "status": "accepted"
+    },
+    {
+      "id": "D-021",
+      "summary": "Pattern detection: 1/day, HDBSCAN cluster embeddings, per-cluster LLM analysis, cross-cluster summary. 1-level recursion (insights→meta-insights, meta excluded from future). No cap. Dedup sim>0.85. Insight weights = weighted average by center of sources.",
+      "status": "accepted"
+    },
+    {
+      "id": "D-022",
+      "summary": "Decay tick interval 5min→1h. 12x reduction in idle decay pressure. Prevents death spiral without conversation.",
+      "status": "accepted"
+    },
+    {
+      "id": "D-023",
+      "summary": "Consolidation dedup+reinforce. All 4 creation paths check novelty at sim>=0.85. Not novel → reinforce existing via apply_retrieval_mutation. Prevents duplicate memory flood.",
+      "status": "accepted"
+    },
+    {
+      "id": "D-024",
+      "summary": "DMN cold-start fallback. When all 4 sampling channels return None, weight-proportional random sampling from all memories. Floor 0.01 on weights.",
+      "status": "accepted"
+    },
+    {
+      "id": "D-025",
+      "summary": "Insight weight inheritance. store_insight computes weighted-avg alpha/beta from sources (center-weighted). No source importance demotion — sources keep weight until insight proves itself.",
       "status": "accepted"
     }
   ],
@@ -93,7 +178,7 @@
       "status": "done",
       "owner": "ai",
       "deliverable": "brain/src/gut.py + POST /context/attention, GET /gut/{agent_id} endpoints",
-      "acceptance_criteria": ["Two centroids compute correctly", "Emotional charge rises on divergence", "Gut summary appears in assembled context", "GATE WIRING: POST /memory/gate passes attention_embedding and emotional_charge to ExitGate.evaluate() — see gate.py:155-156. Currently None/0.0, must come from GutFeeling.attention_centroid and GutFeeling.emotional_charge"],
+      "acceptance_criteria": ["Two centroids compute correctly", "Emotional charge rises on divergence", "Gut summary appears in assembled context", "GATE WIRING: POST /memory/gate passes attention_embedding and emotional_charge to ExitGate.evaluate()"],
       "verification": ["Send messages on different topics, verify centroid shift", "Check gut_state endpoint", "Verify /memory/gate exit gate uses emotional_charge_bonus when charge >= 0.3"]
     },
     {
@@ -147,26 +232,88 @@
     {
       "id": "T-P9",
       "title": "Replace OpenClaw default AGENTS.md with brain-aware version",
-      "intent": "Remove conflicting file-based memory instructions (SOUL.md, MEMORY.md, memory/) from the agent's system prompt. Replace with minimal AGENTS.md that orients agent toward brain-based memory. Also fix [[reply_to_current]] tag leak.",
+      "intent": "Remove conflicting file-based memory instructions. Add web search guidance (D-020). Fix [[reply_to_current]] tag leak.",
       "depends_on": ["T-P8"],
       "priority": "P1",
-      "status": "todo",
+      "status": "done",
       "owner": "ai",
-      "deliverable": "Custom AGENTS.md in openclaw-config workspace, [[reply_to_current]] fix",
-      "acceptance_criteria": ["Agent system prompt has no references to SOUL.md/MEMORY.md/file-based memory", "Agent understands its memory comes from brain service", "No [[reply_to_current]] tag in agent output"],
+      "deliverable": "Custom AGENTS.md in openclaw-config workspace, [[reply_to_current]] fix, web search rules",
+      "acceptance_criteria": ["Agent system prompt has no references to SOUL.md/MEMORY.md/file-based memory", "Agent understands its memory comes from brain service", "No [[reply_to_current]] tag in agent output", "Web search guidance: brain memory trusted, LLM training data not, max 3 searches/turn"],
       "verification": ["curl /context/assemble — no SOUL.md/MEMORY.md references", "Chat via WebChat — no tag leak in responses"]
     },
     {
       "id": "T-P10",
       "title": "DMN observability: surface agent's inner monologue",
-      "intent": "Make DMN thoughts, rumination threads, and consolidation insights visible. Currently DMN output is scattered across ephemeral queues, disk files, and DB rows with no unified view. Need a way to see what the agent is 'thinking' — its self-prompts, rumination threads, tension discoveries, and pattern detections.",
+      "intent": "Make DMN thoughts, rumination threads, and consolidation insights visible.",
       "depends_on": ["T-P8"],
       "priority": "P2",
-      "status": "todo",
+      "status": "done",
       "owner": "ai",
       "deliverable": "Unified endpoint or dashboard showing DMN thoughts, active rumination threads, consolidation log entries, and tension memories",
       "acceptance_criteria": ["Can see rumination thread content and history", "Can see DMN-generated thoughts with channel labels", "Can see consolidation insights and tension detections", "Can see what source_tag=internal_dmn memories were created"],
       "verification": ["Leave agent idle, poll endpoint, verify thoughts appear", "Check rumination state shows thread progression"]
+    },
+    {
+      "id": "T-P11",
+      "title": "Proactive notification system",
+      "intent": "Allow agent to contact user outside conversation when research or DMN produces urgent/important results. Urgency (time-sensitive) triggers push notification. Importance (content significance) triggers passive mention next conversation. Neither depends on memory weight.",
+      "depends_on": ["T-P10"],
+      "priority": "P3",
+      "status": "todo",
+      "owner": "ai",
+      "deliverable": "notification_outbox DB table, importance/urgency scoring (weight + semantic + temporal), delivery worker (async, Telegram first), user notification preferences (channels, quiet hours, thresholds), passive injection for non-push notifications",
+      "acceptance_criteria": ["notification_outbox table created with urgency/importance scoring", "Delivery worker sends Telegram messages for urgent items", "Passive notifications injected into cognitive state for important non-urgent items", "Quiet hours respected", "User can configure channels and thresholds"],
+      "verification": ["Create urgent notification, verify Telegram delivery", "Create important notification, verify appears in next conversation context", "Set quiet hours, verify delivery delayed"]
+    },
+    {
+      "id": "T-S18",
+      "title": "Deploy Session 18 fixes: DB cleanup + restart + verify",
+      "intent": "Apply all Session 18 code changes (D-022/D-023/D-024/D-025/BUG-001) and clean up the 101 junk memories from the truncation bug.",
+      "depends_on": [],
+      "priority": "P0",
+      "status": "done",
+      "owner": "ai",
+      "deliverable": "Clean DB with only real memories, brain restarted with all fixes, verified consolidation produces complete output",
+      "acceptance_criteria": [
+        "Junk consolidation memories (fragments <80 chars with ac=0) deleted or merged",
+        "8 real semantic memories preserved with original weights",
+        "Best-of-cluster consolidation memories preserved (highest center per duplicate group)",
+        "Brain container restarted with new code",
+        "Consolidation produces complete insights (not fragments)",
+        "DMN fallback samples memories successfully",
+        "Decay tick fires every 1h (not 5min)",
+        "Dedup prevents duplicate creation on next consolidation cycle"
+      ],
+      "verification": [
+        "SELECT count(*), avg(length(content)) FROM memories WHERE agent_id='default' — count reduced, avg length increased",
+        "docker compose restart brain && docker compose logs -f brain — no errors",
+        "Wait for consolidation cycle — check new insights are complete sentences (100+ chars)",
+        "Wait for DMN heartbeat — check _sample_fallback fires and samples a memory",
+        "Wait 1h — verify decay_tick only fires once (not 12 times)",
+        "Trigger consolidation — verify no new duplicates created (check_novelty catches them)"
+      ],
+      "implementation_notes": {
+        "files_changed": [
+          "brain/src/llm.py — removed max_output_tokens, thinking model runs unrestricted (BUG-001)",
+          "brain/src/consolidation.py — D-022: DECAY_TICK_INTERVAL 300->3600. D-023: all 4 creation paths (tensions, insights, narratives, revalidation) check_novelty at 0.85, reinforce existing via apply_retrieval_mutation instead of creating new",
+          "brain/src/memory.py — D-025: store_memory accepts initial_alpha/initial_beta. store_insight computes weighted-avg alpha/beta from sources (center-weighted). Removed source importance demotion.",
+          "brain/src/idle.py — D-024: _sample_fallback added. When all 4 channels return None, picks from ALL memories with probability proportional to weight center (floor 0.01)."
+        ],
+        "db_cleanup_plan": [
+          "Step 1: Identify keeper memories — for each duplicate cluster (sim>=0.95), keep the one with highest center (or highest access_count if tied)",
+          "Step 2: Delete non-keeper duplicates — DELETE FROM memories WHERE id IN (non-keeper-ids) AND agent_id='default'",
+          "Step 3: Clean orphaned supersedes links — DELETE FROM memory_supersedes WHERE source_id NOT IN (SELECT id FROM memories) OR insight_id NOT IN (SELECT id FROM memories)",
+          "Step 4: Verify — SELECT count(*), type, avg(length(content)) FROM memories WHERE agent_id='default' GROUP BY type",
+          "Step 5: Restart brain — docker compose up -d brain"
+        ],
+        "root_causes_fixed": {
+          "BUG-001": "gemini-3-flash-preview thinking model consumed max_output_tokens budget with internal chain-of-thought. max_tokens=200 left ~20 tokens for actual output. Fix: removed max_output_tokens entirely.",
+          "decay_spiral": "D-022 reduces decay from 0.12 beta/hr to 0.01 beta/hr. No conversation needed to survive.",
+          "duplicate_flood": "D-023 checks novelty on ALL creation paths. 49% of pool were near-exact duplicates (sim>=0.95). Now reinforces existing instead of creating new.",
+          "dmn_dead": "D-024 bypasses unreachable channel thresholds (>0.5/>0.6 center when max is 0.24). Fallback samples any memory weighted by center.",
+          "source_demotion": "D-025 removes importance cap on source memories. Insights inherit source weights instead of starting at fixed 1.0/4.0."
+        }
+      }
     }
   ]
 }

@@ -590,6 +590,15 @@ async def context_assemble(req: ContextAssembleRequest):
         conversation=req.conversation,
         total_budget=req.total_budget,
     )
+
+    # Mutate memories that were actually injected into context
+    injected_ids = context.get("injected_memory_ids", [])
+    if injected_ids:
+        try:
+            await store.apply_retrieval_mutation(injected_ids, req.agent_id)
+        except Exception as e:
+            logger.warning("Context injection mutation failed for %s: %s", req.agent_id, e)
+
     system_prompt = render_system_prompt(context)
 
     # Persist gut state
@@ -741,6 +750,139 @@ async def dmn_activity(req: DMNActivityRequest):
         agent_id=req.agent_id,
         acknowledged=True,
         idle_seconds=max(0.0, idle_secs),
+    )
+
+
+# ── Monologue (Unified Inner View) ──────────────────────────────────
+
+
+class MonologueEntry(BaseModel):
+    ts: str
+    type: str  # "thought", "consolidation", "tension", "narrative", "reflection"
+    content: str
+    channel: str | None = None
+    operation: str | None = None
+    source_memory_id: str | None = None
+    memory_id: str | None = None
+    details: dict | None = None
+
+
+class RuminationSummary(BaseModel):
+    active: dict | None = None
+    recent_completed: list[dict] = Field(default_factory=list)
+
+
+class MonologueResponse(BaseModel):
+    agent_id: str
+    entries: list[MonologueEntry] = Field(default_factory=list)
+    rumination: RuminationSummary = Field(default_factory=RuminationSummary)
+
+
+@app.get("/monologue/{agent_id}", response_model=MonologueResponse)
+async def monologue(agent_id: str, limit: int = Query(default=50, ge=1, le=200)):
+    """Unified view of the agent's inner monologue: DMN thoughts,
+    consolidation operations, and recent reflection/tension/narrative memories."""
+    pool = await get_pool()
+
+    # Query all sources in parallel
+    dmn_rows, consol_rows, memory_rows = await asyncio.gather(
+        pool.fetch(
+            """
+            SELECT thought, channel, source_memory_id, created_at
+            FROM dmn_log
+            WHERE agent_id = $1
+            ORDER BY created_at DESC LIMIT $2
+            """,
+            agent_id,
+            limit,
+        ),
+        pool.fetch(
+            """
+            SELECT operation, details, created_at
+            FROM consolidation_log
+            WHERE agent_id = $1
+            ORDER BY created_at DESC LIMIT $2
+            """,
+            agent_id,
+            limit,
+        ),
+        pool.fetch(
+            """
+            SELECT id, content, type, created_at
+            FROM memories
+            WHERE agent_id = $1
+              AND type IN ('tension', 'narrative', 'reflection')
+              AND source = 'consolidation'
+            ORDER BY created_at DESC LIMIT $2
+            """,
+            agent_id,
+            limit,
+        ),
+    )
+
+    entries: list[MonologueEntry] = []
+
+    for row in dmn_rows:
+        entries.append(MonologueEntry(
+            ts=row["created_at"].isoformat(),
+            type="thought",
+            content=row["thought"],
+            channel=row["channel"],
+            source_memory_id=row["source_memory_id"],
+        ))
+
+    for row in consol_rows:
+        details = row["details"] if isinstance(row["details"], dict) else {}
+        summary = details.get("summary", row["operation"])
+        entries.append(MonologueEntry(
+            ts=row["created_at"].isoformat(),
+            type="consolidation",
+            content=str(summary),
+            operation=row["operation"],
+            details=details,
+        ))
+
+    for row in memory_rows:
+        entries.append(MonologueEntry(
+            ts=row["created_at"].isoformat(),
+            type=row["type"],
+            content=row["content"],
+            memory_id=row["id"],
+        ))
+
+    # Sort all entries by timestamp descending, take top N
+    entries.sort(key=lambda e: e.ts, reverse=True)
+    entries = entries[:limit]
+
+    # Rumination state
+    rumination = RuminationSummary()
+    if _idle_loop is not None:
+        rm = _idle_loop._rumination.get(agent_id)
+        if rm is not None:
+            if rm.has_active_thread():
+                t = rm.active_thread
+                rumination.active = {
+                    "topic": t.topic,
+                    "cycle_count": t.cycle_count,
+                    "seed_memory_id": t.seed_memory_id,
+                    "history": [
+                        {"cycle": h["cycle"], "summary": h["summary"], "ts": h["ts"]}
+                        for h in (t.history[-5:] if t.history else [])
+                    ],
+                }
+            rumination.recent_completed = [
+                {
+                    "topic": ct.get("topic", "")[:100],
+                    "resolution_reason": ct.get("resolution_reason", ""),
+                    "cycles": ct.get("cycles", 0),
+                }
+                for ct in (rm.completed_threads[-5:] if rm.completed_threads else [])
+            ]
+
+    return MonologueResponse(
+        agent_id=agent_id,
+        entries=entries,
+        rumination=rumination,
     )
 
 

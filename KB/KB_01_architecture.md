@@ -35,6 +35,9 @@ See `KB/blueprints/v0.3_current_state.md` for the current blueprint (done phases
 | DJ-001 | memory | L0/L1 layers discarded for unified memory | — | 2026-02-19 |
 | DJ-002 | llm | Anthropic Haiku replaced by Gemini 3 Flash Preview (Max OAuth restricted) | — | 2026-02-21 |
 | DJ-003 | gate | Hunger curve: dynamic gate threshold based on memory count. Newborn agents absorb everything, selectivity increases as memories accumulate. | — | 2026-02-21 |
+| DJ-005 | identity | D-015 floor dropped: pure weight×cosine_sim. Any floor creates immortal memories. | D-015 original | 2026-02-22 |
+| DJ-006 | identity | D-017 core/active split dropped, identity hash dormant. Core tier = immortal by construction. Values are dispositional, not declarative. | D-017 original | 2026-02-22 |
+| DJ-007 | consolidation | D-016 revised: agent research sessions with web search instead of internal LLM fact-check. Training data not reliable for verification. | D-016 original | 2026-02-22 |
 
 ## Phase 1: Memory Core (implemented)
 
@@ -95,11 +98,12 @@ DELETE /memory/{memory_id}?agent_id=X
 | `search_similar(query, agent_id, ...)` | POST /retrieve (mode=similar) | gate (P2) |
 | `search_hybrid(query, agent_id, ...)` | POST /retrieve (mode=hybrid) | context assembly (P3) |
 | `search_reranked(query, agent_id, ...)` | POST /retrieve (mode=reranked) | — |
-| `apply_retrieval_mutation(ids, agent_id, ...)` | auto via search | — |
+| `apply_retrieval_mutation(ids, agent_id, ...)` | auto via search + context assembly | context assembly (P3), gate (P2) |
+| `touch_memory(memory_id, agent_id)` | — | gate (P2) novelty check |
 | `buffer_scratch(content, agent_id, ...)` | — | gate (P2) |
 | `flush_scratch(agent_id, ...)` | — | gate (P2) |
 | `cleanup_expired_scratch(agent_id)` | — | gate (P2) |
-| `check_novelty(content, agent_id, threshold)` | — | gate (P2) |
+| `check_novelty(content, agent_id, threshold)` → `(bool, float, str\|None)` | — | gate (P2), consolidation (P5) |
 | `get_stale_memories(agent_id, ...)` | — | consolidation (P5) |
 | `decay_memories(ids, agent_id, factor)` | — | consolidation (P5) |
 | `avg_depth_weight_center(agent_id)` | — | consolidation (P5) |
@@ -145,7 +149,8 @@ api.py          ← memory, db
   Irrelevant   | Drop(0.05)     | Drop+noise     | Drop+noise
   ```
 - Relevance axis: `spreading_activation(content_embedding, attention, layers)` → core (≥0.6) / peripheral (≥0.3) / irrelevant
-- Novelty axis: `check_novelty()` + `detect_contradiction_negation()` → confirming (sim≥0.85) / novel (sim<0.6) / contradicting (sim≥0.7 + negation markers)
+- Novelty axis: `check_novelty()` → `(is_novel, max_similarity, most_similar_id)` + `detect_contradiction_negation()` → confirming (sim≥0.85) / novel (sim<0.6) / contradicting (sim≥0.7 + negation markers)
+- **Gate touch** (D-012): after novelty check, calls `touch_memory(most_similar_id)` — refreshes `last_accessed` only (no access_count, no alpha/beta). Prevents decay for 24h on referenced memories. "Stay of execution, not a promotion."
 - Score: `base_score * (0.5 + 0.5 * s_i) * hunger_boost + emotional_charge_bonus`
 - **Hunger curve** (D-009): dynamic score multiplier based on memory count. Newborn agents (0 memories) get `hunger_max_boost=2.5`, decaying exponentially (`exp(-count/10)`) toward 1.0 as memories accumulate. When hunger-boosted score ≥ 0.5 and hunger > 1.05, BUFFER is promoted to PERSIST. This solves the cold-start problem where newborn agents couldn't form memories because everything scored as peripheral×novel→buffer.
 - Noise floor: 2% chance DROP → BUFFER
@@ -161,6 +166,10 @@ Pipeline: entry gate → scratch buffer → exit gate → act on decision:
 - PERSIST/PERSIST_HIGH/PERSIST_FLAG → `store_memory()` with importance derived from gate score
 - REINFORCE → find most similar memory + `apply_retrieval_mutation()`
 - BUFFER → leave in scratch (24h TTL, consolidation picks up later)
+
+**`apply_retrieval_mutation()` internals** (D-013): Two separate UPDATE operations:
+1. **access_count** (unconditional): `access_count += 1`, `last_accessed = NOW()`, append to `access_timestamps`. Not subject to safety checks. Skips immutable.
+2. **alpha boost** (safety-gated): `depth_weight_alpha += gain` (0.1 default, 0.2 for dormant high-score). Goes through DiminishingReturns + TwoGateGuardrail. Skips immutable.
 - DROP/SKIP → clean up scratch
 
 **Plugin update** (`openclaw/extensions/memory-brain/index.ts`):
@@ -200,7 +209,8 @@ api.py          ← memory, gate, db
 
 **Brain modules:**
 - `brain/src/context_assembly.py` — dynamic context injection + identity rendering:
-  - `assemble_context(memory_store, agent_id, ...)` — Track 0 (immutable safety) + identity hash + Track 2 (stochastic identity memories, Beta-sampled `observe() > 0.6`) + Track 1 (situational via `search_hybrid(mutate=False)`)
+  - `assemble_context(memory_store, agent_id, ...)` — Track 0 (immutable safety) + identity hash + Track 2 (stochastic identity memories, Beta-sampled `observe() > 0.6`) + Track 1 (situational via `search_hybrid(mutate=False)`). Returns `injected_memory_ids` — IDs of non-immutable memories that survived budget trimming and were actually injected.
+  - **Retrieval mutation** (D-012): after assembly, `api.py` calls `apply_retrieval_mutation(injected_ids)` — increments `access_count` + boosts `depth_weight_alpha` for memories that influenced the agent's output. access_count always increments (factual counter); alpha boost goes through safety check (D-013).
   - Token budgets: identity max 3000, situational 2000, output buffer 4000
   - `render_system_prompt()` → `[SAFETY BOUNDARIES]`, `[IDENTITY]`, `[IDENTITY -- active beliefs/values]`, `[RELEVANT MEMORIES]`, cognitive state
   - `render_identity_hash(memory_store, agent_id)` — compact ~100-200 tokens from top-10 memories by weight center (replaces LayerStore.render_identity_hash)
@@ -301,21 +311,24 @@ api.py               <- memory, gate, context_assembly, gut, db, numpy
 
 - `brain/src/consolidation.py` -- background memory processing:
   - **Tier 1 (ConstantConsolidation)** -- 30s loop, 3 scheduled operations:
-    - `_decay_tick()` every 5min: `beta += 0.01` for stale memories (24h+ not accessed, non-immutable, center > 0.1)
-    - `_contradiction_scan()` every 10min: fetch 10 recent memories, 2 random pairs, LLM contradiction check, store tensions (memory_type="tension", source="consolidation")
+    - `_decay_tick()` every 1 hour (D-022, was 5min): beta += 0.01 for stale memories (24h+ not accessed, non-immutable, center > 0.1). Decay pressure: 0.01 beta/hr (was 0.12).
+    - `_contradiction_scan()` every 10min: fetch 10 recent memories, 2 random pairs, LLM contradiction check. D-023: novelty-checked at sim>=0.85 before storing, reinforces existing if duplicate.
     - `_pattern_detection()` every 15min: fetch 50 recent memories (7d), greedy cosine cluster at 0.85, log clusters with 3+ members
   - **Tier 2 (DeepConsolidation)** -- hourly or triggered:
-    - `_merge_and_insight()`: LLM generates questions from recent memories, extracts insights via search_similar + LLM, novelty-checked, stored via `store_insight()` (links `memory_supersedes`), clusters reflections into first-person narratives (memory_type="narrative")
-    - `_promote_patterns()`: D-005 simplified -- direct SQL alpha updates. Goal promotion (5+ access, 14d+, center<0.65, alpha+=2.0). Identity promotion (10+ access, 30d+, center 0.65-0.82, alpha+=5.0). No L0/L1 writes.
-    - `_decay_and_reconsolidate()`: stale memories (90d, <3 access) get beta+=1.0. Revalidates existing insights via `why_do_i_believe()` + LLM, stores updated insight if changed, weakens old.
-    - `_tune_parameters()`: Shannon entropy over 20 bins of weight centers, log only (Phase 7 adds enforcement).
-    - `_contextual_retrieval()`: generates WHO/WHEN/WHY preambles via LLM, updates `content_contextualized` column, re-embeds with contextualized content.
-  - **ConsolidationEngine** -- runs both tiers via `asyncio.gather()`, supports trigger + status
+    - `_merge_and_insight()`: LLM generates questions from recent memories, extracts insights via search_similar + LLM. D-023: novelty-checked, if sim>=0.85 reinforces existing via apply_retrieval_mutation instead of creating new. Clusters reflections into first-person narratives (also novelty-checked).
+    - `_promote_patterns()`: D-005 simplified -- direct SQL alpha updates. Goal promotion (5+ access, 14d+, center<0.65, alpha+=2.0). Identity promotion (10+ access, 30d+, center 0.65-0.82, alpha+=5.0).
+    - `_decay_and_reconsolidate()`: stale memories (90d, <3 access) get beta+=1.0. Revalidates existing insights via LLM. D-023: novelty-checked before storing updated insight.
+    - `_tune_parameters()`: Shannon entropy over 20 bins of weight centers, log only.
+    - `_contextual_retrieval()`: generates WHO/WHEN/WHY preambles via LLM, updates content_contextualized column, re-embeds with contextualized content.
+  - **ConsolidationEngine** -- runs both tiers via asyncio.gather(), supports trigger + status
+  - **Dedup threshold**: MERGE_SIMILARITY_THRESHOLD = 0.85, used across all 4 creation paths
 
 - Error isolation: every operation wrapped in individual try/except, one failing agent/operation does not crash the engine
-- Multi-agent: iterates `SELECT DISTINCT agent_id FROM memories` each cycle
-- All operations log to `consolidation_log` table (9 log call sites)
-- Insight linking via `memory_supersedes` table (2 `store_insight` calls)
+- Multi-agent: iterates SELECT DISTINCT agent_id FROM memories each cycle
+- All operations log to consolidation_log table
+- Insight linking via memory_supersedes table. D-025: store_insight inherits weighted-avg alpha/beta from sources, no source importance demotion.
+
+BUG-001 (Session 18): gemini-3-flash-preview is a thinking model. Internal chain-of-thought consumes from max_output_tokens budget. With default max_tokens=200, model spent approx 180 on thinking, left approx 20 for output. All consolidation insights were sentence fragments. Fix: remove max_output_tokens cap.
 
 **API endpoints** (in `brain/src/api.py`, version 0.4.0):
 ```
@@ -361,7 +374,7 @@ api.py               <- memory, gate, context_assembly, gut, consolidation, db, 
 - `brain/src/dmn_store.py` — ephemeral thought queue:
   - `AttentionCandidate` dataclass: thought, channel (`DMN/goal`, `DMN/creative`, `DMN/identity`, `DMN/reflect`), urgency (always 0.2), memory_id, timestamp
   - `ThoughtQueue`: `defaultdict(asyncio.Queue)` per agent_id. Methods: `put_thought()`, `get_thoughts()` (non-blocking drain), `queue_size()`, `all_queue_sizes()`
-  - In-memory only — no persistence. Thoughts are ephemeral and opportunistic.
+  - In-memory queue is ephemeral, but thoughts are also persisted to `dmn_log` table for observability (Session 19).
 
 - `brain/src/idle.py` — DMN idle loop:
   - `IdleLoop`: main background loop (same pattern as consolidation.py — `asyncio.wait_for(shutdown_event.wait(), timeout=...)`)
@@ -379,9 +392,16 @@ api.py               <- memory, gate, context_assembly, gut, consolidation, db, 
     4. Default: `DMN/reflect`
   - **Thread lifecycle**: `_start_new_thread()` calls LLM (temperature=0.6), `_continue_thread()` calls LLM (temperature=0.5, checks for "THREAD_RESOLVED")
   - **Repetition filter**: `_is_repetitive()` checks thought[:50] against last 5 topics per agent
+  - **Thought persistence** (Session 19): after queueing, `_queue_thought()` INSERTs into `dmn_log` table (non-blocking, try/except wrapped)
   - D-005 adaptation: goals from DB query (high-weight narrative/reflection), not LayerStore
 
-**API endpoints** (in `brain/src/api.py`, version 0.5.0):
+**DB table** — `dmn_log` (Session 19):
+```sql
+dmn_log (id SERIAL PK, agent_id TEXT, thought TEXT, channel TEXT, source_memory_id TEXT, created_at TIMESTAMPTZ)
+idx_dmn_log_agent ON dmn_log (agent_id, created_at DESC)
+```
+
+**API endpoints** (in `brain/src/api.py`, version 0.6.0):
 ```
 GET  /dmn/thoughts?agent_id=X
   Response (DMNThoughtResponse): { agent_id, thoughts: [{ thought, channel, urgency, memory_id, timestamp }], count }
@@ -392,11 +412,16 @@ GET  /dmn/status
 POST /dmn/activity
   Request  (DMNActivityRequest):  { agent_id }
   Response (DMNActivityResponse): { agent_id, acknowledged, idle_seconds }
+
+GET  /monologue/{agent_id}?limit=50
+  Response (MonologueResponse): { agent_id, entries: [{ ts, type, content, channel?, operation?, source_memory_id?, memory_id?, details? }], rumination: { active?, recent_completed[] } }
+  Unified view combining: dmn_log (thoughts), consolidation_log (operations), memories (tension/narrative/reflection), rumination state (active thread + recent completed)
 ```
 
 **Plugin update** (`openclaw/extensions/memory-brain/index.ts`):
 - Tool: `dmn_status` — calls `GET /dmn/status`, shows running state + heartbeats + queues + threads
-- HTTP clients: `brainGetDMNThoughts()`, `brainNotifyActivity()`, `brainGetDMNStatus()`
+- Tool: `monologue` — calls `GET /monologue/{agent_id}`, unified inner monologue view with optional limit param
+- HTTP clients: `brainGetDMNThoughts()`, `brainNotifyActivity()`, `brainGetDMNStatus()`, `brainGetMonologue()`
 - Hook update: `before_agent_start` calls `brainNotifyActivity()` (fire-and-forget) to reset DMN idle timer on user input
 
 ## Phase 7: Safety Monitor (implemented)
@@ -497,19 +522,97 @@ api.py               <- memory, gate, context_assembly, gut, consolidation, idle
 - Agent starts as newborn, gets BOOTSTRAP_PROMPT until all 10 milestones achieved
 - Identity emerges from memory reinforcement (high-weight memories surface as identity)
 
+**AGENTS.md** (`openclaw-workspace/AGENTS.md`, synced to `openclaw-config/AGENTS.md`):
+- Memory: brain service only, no file-based memory (SOUL.md/MEMORY.md ignored)
+- Anti-drift, intellectual honesty, verification table
+- D-020 web search rules: brain memory trusted, LLM training data NOT, max 3 searches/turn
+- Reply tag suppression: never echo `[[reply_to_current]]` or `[[ ... ]]` directives
+- Group chat etiquette, heartbeat guidance, platform formatting rules
+
 **Key decisions:**
 - D-007: Agent LLM = Gemini 3 Flash Preview, reusing brain's GOOGLE_API_KEY as GEMINI_API_KEY
 - D-008: No preset identity — newborn agent discovers itself through bootstrap milestones
+- D-020: Web search rules in AGENTS.md — brain memory > web search > training knowledge
 
 **Full stack**:
 ```
 postgres (:5433)  →  brain (:8400)  →  openclaw (:18789)
   pgvector             FastAPI            Node.js gateway
-  memories table       19 endpoints       memory-brain plugin
+  memories table       20 endpoints       memory-brain plugin
                        Gemini embed       Gemini 3 Flash (conversations)
                        Gemini Flash       WebChat UI
-                       (consolidation)    8 tools, 2 hooks
+                       (consolidation)    9 tools, 2 hooks
 ```
+
+## Session 17 Brainstorm: Identity Architecture Redesign
+
+> Brainstorm session. No code changes. All decisions accepted in principle, need implementation plans.
+
+**Core principle: injection = reinforcement = survival.** Anything injected into the system prompt gets retrieval mutation (access_count + alpha boost). Therefore the injection criteria IS the survival criteria. This is the foundation of all Session 17 decisions.
+
+### Identity Injection (D-015 revised, D-017 revised)
+
+**Formula:** `injection_score = weight_center * cosine_sim` — no floor, no core tier.
+
+**System prompt structure (revised):**
+```
+[SAFETY BOUNDARIES]      ← immutables only (always injected, deliberately immortal)
+[ACTIVE IDENTITY]        ← w×s scored memories (topic-dependent, cached between subject changes)
+[RELEVANT MEMORIES]      ← situational, w×s scored
+[COGNITIVE STATE]         ← gut, DMN, pending notifications
+```
+
+**Identity hash:** dormant (`IDENTITY_HASH_ENABLED = False`). Exists in code, not called. Rationale: heavy identity injection = strong ego = rigid agent. Let w×s prove what matters.
+
+**Active identity caching (D-018a):** Recompute only when context_shift exceeds adaptive threshold. Threshold = P75 of last 200 context_shift values (self-evolving). Bootstrap default 0.5. Ring buffer of shift values, percentile recomputed each turn.
+
+**Value emergence:** Abstract values ("I value honesty") are never stored directly. Behavioral instances ("I told user their code had a flaw") are stored, compete on w×s, get reinforced when similar situations arise. Consolidation detects behavioral patterns → creates insight memories. Insights inherit weighted-average alpha/beta from source memories (heavy sources skew more). Values are dispositional, not declarative.
+
+### Memory Chunking (D-018b, D-018c)
+
+**Gate-time chunking:** Content > 300 tokens → semantic chunking into separate linked memories. Each chunk gets own embedding (computed from full chunk text). Full injection (no truncation) — token budget limits count, not content.
+
+**Memory groups:** Chunks linked by `memory_group_id`. Group beta refresh: any chunk accessed → all group members get `touch_memory()`. Insights synthesized from single group share the group_id. Injected chunks show: `[part N of M — recall for full context]`. Consolidation creates synthesis insights across groups but never merges chunks.
+
+### Consolidation Research (D-016 revised)
+
+**Flow:** Contradiction detected → cheap LLM classification (factual/subjective, research yes/no, confidence) → if factual + confidence>0.7: spawn agent research session with web search → verdict with self-assessed confidence → HIGH confidence: displace loser + create correction memory, MEDIUM: log as "likely resolved" keep both, LOW: log "unresolved tension."
+
+**Budget:** 1 session/hour, max 24/day. Priority: highest single weight of either contradicting memory. Skip contradictions where both memories < 0.3 center. 24h cooldown on research-spawned memories (tag: `source_tag='consolidation_research'`).
+
+**Session isolation:** Research session uses separate context, doesn't pollute user conversation. Gate creates only `type=correction` memories from research output.
+
+### Pattern Detection (D-021)
+
+**Pipeline:** Pre-filter (weight>0.25, access>2) → HDBSCAN cluster on embeddings → per-cluster LLM pattern analysis → cross-cluster summary. Run 1/day.
+
+**Recursion:** 1 level allowed. Raw memories → insights (level 1) → meta-insights (level 2). Level 2 excluded from future pattern detection. Tag: `insight_level=1|2`.
+
+**Dedup:** Before creating insight, check cosine_sim against existing insights. sim>0.85 → reinforce existing instead of creating new.
+
+**No cap** on insight count (observe what happens).
+
+### Observability (D-018d)
+
+**injection_logs table:** Every identity injection logged with query_text, all candidates (memory_id, weight, cosine_sim, score, injected, rank), budget usage, cache_hit. Behavioral responses correlated by turn_id.
+
+**3-tier analysis:**
+- Tier 1 (real-time): rolling metrics via in-memory ring buffer. GET /debug/injection-metrics.
+- Tier 2 (daily): SQL aggregation + batch LLM classification of behavioral decisions. Score distributions, high-weight rejection analysis, memories-influenced-behavior rate.
+- Tier 3 (weekly): anomaly detection. Drift from baseline → alerts routed to DMN thought queue.
+
+### Proactive Notifications (D-019)
+
+**Urgency ≠ importance ≠ weight.** A low-weight memory about a doctor appointment can be urgent + important.
+- Urgency (time-sensitive): temporal markers, deadlines → push notify immediately
+- Importance (content significance): health, safety, commitments → "btw" next conversation
+- Weight (reinforcement history): how established the memory is → not a notification factor
+
+**Delivery:** notification_outbox DB table → async delivery worker → configured channels (Telegram bot API first, WhatsApp/webhook later). User preferences: channels, quiet hours, importance threshold. T-P11 in roadmap.
+
+### AGENTS.md Web Search (D-020)
+
+Brain memory = trusted. LLM training data = NOT trusted. Agent must verify facts from training data via web search. Rate limit: 3 searches/turn. Specified in AGENTS.md.
 
 ## Decision Journal
 
@@ -525,6 +628,34 @@ postgres (:5433)  →  brain (:8400)  →  openclaw (:18789)
 - **Now:** Identity emerges from unified memory table Beta weights. Top-N high-weight memories serve as gate relevance signal and identity render source. No separate files.
 - **Why:** L0/L1 is a derived cache of the memory table, not a source of truth. The original's own context assembly Track 2 already pulls identity from DB by depth_weight center. Consolidation writes back to L0/L1 FROM memory — remove the middleman. Simpler, one table, identity IS the weights.
 - **Lesson:** When the "cache" has its own CRUD API and the source already provides the same data, the cache is adding complexity not value. See `KB/blueprints/v0.2_unified_memory_rework.md` for full rework plan.
+
+### DJ-005 [identity] D-015 floor dropped — pure weight × cosine_sim
+
+- **Was:** `injection_score = weight_center * (0.3 + 0.7 * cosine_sim)` — 0.3 floor guaranteed minimum score for irrelevant high-weight memories, decaying with maturity
+- **Now:** `injection_score = weight_center * cosine_sim` — zero relevance = zero score regardless of weight
+- **Why:** Any floor creates immortal memories by guaranteeing injection → reinforcement → alpha boost → can never accumulate enough beta to decay. The floor protects memories from the natural selection pressure that makes the system work. Even a 0.1 floor gives high-weight memories an unfair survival advantage regardless of relevance.
+- **Lesson:** In a system where injection = reinforcement, the injection criteria IS the survival criteria. Making relevance mandatory for injection ensures irrelevant memories die naturally. Weight amplifies relevance but cannot substitute for it.
+
+### DJ-006 [identity] D-017 core/active split dropped — identity hash dormant
+
+- **Was:** Two tiers: core (always injected: immutable + earned via weight>0.7 + access>20) and active (vector-scored, competes on w×s)
+- **Now:** No core tier. Identity hash feature-flagged dormant (`IDENTITY_HASH_ENABLED = False`). System prompt = immutables + w×s scored memories. Core values emerge from behavioral patterns via consolidation insights, not from protected tiers.
+- **Why:** Core tier would always be injected → always reinforced → weight only goes up → can never decay. This makes "core" immortal by construction, not by merit. Also: strong ego (heavy identity injection) = rigid agent. Less identity = better performance and adaptability. Values aren't declarative ("I value honesty") — they're dispositional (patterns of honest behavior). Consolidation detects these patterns and creates insights that compete on w×s like everything else.
+- **Lesson:** If you protect something from selection pressure, you remove the mechanism that makes it earn its place. Let the system prove what matters through use, not through designation.
+
+### DJ-007 [consolidation] D-016 revised — agent research sessions instead of internal fact-check
+
+- **Was:** Consolidation's contradiction handler does internal LLM fact-check from training knowledge
+- **Now:** Contradiction spawns a full agent session with web search tools. Agent researches the contradiction using the same tools available in regular conversation.
+- **Why:** LLM training data is not a reliable source for factual verification (may be outdated, hallucinated, or biased). Real fact-checking requires external sources. Reusing agent session infrastructure means no new pipeline — just a new "user message" that's the contradiction description. Budget: 1/hour, max 24/day. LLM judges worthiness (factual vs subjective, confidence>0.7) before spawning expensive session.
+- **Lesson:** Don't build parallel infrastructure when you can reuse existing infrastructure with a different input.
+
+### DJ-004 [gate] Retrieval mutation loop was disconnected — death spiral
+
+- **Was:** `context_assembly.py` called `search_hybrid(mutate=False)`, `apply_retrieval_mutation()` bundled access_count + alpha boost behind safety. Result: access_count=0 for all memories, alpha stuck at 1.0, consolidation decay pushed beta up unchecked, weight centers dropped below 0.3 identity threshold, gate ran blind (s_i=0.35), couldn't persist new memories.
+- **Now:** (D-012) Two mutation types: context injection does full mutation (access_count + alpha), gate touch refreshes last_accessed only. (D-013) access_count separated from alpha boost — safety can't block counting. `assemble_context()` returns `injected_memory_ids`, `api.py` calls `apply_retrieval_mutation()` on them. `check_novelty()` returns 3-tuple with memory ID for gate touch.
+- **Why:** The system was designed for feedback (gate uses identity embeddings from high-weight memories, memories gain weight from retrieval) but the feedback path was never connected. Context assembly was intentionally read-only (`mutate=False`) but this broke the loop.
+- **Lesson:** Feedback loops require explicit wiring. "Read-only by default" is safe but can silently break downstream systems that depend on mutation side-effects. The decay/reinforcement balance must be tested end-to-end, not just each component in isolation.
 
 <!--
 RULES:
