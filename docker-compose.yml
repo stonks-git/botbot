@@ -34,7 +34,6 @@ services:
     environment:
       - DATABASE_URL=postgresql://agent:${AGENT_DB_PASSWORD:-agent_secret}@postgres:5432/agent_memory
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
     volumes:
       - ./brain-state:/app/state:rw
     networks:

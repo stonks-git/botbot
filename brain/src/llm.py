@@ -1,33 +1,34 @@
 """LLM client wrapper for consolidation prompts.
 
-Uses Anthropic Claude (Haiku 4.5) for all background consolidation tasks:
+Uses Google Gemini 2.0 Flash for all background brain tasks:
 contradiction detection, insight generation, narrative synthesis, etc.
+Shares the same GOOGLE_API_KEY used for embeddings.
 """
 
 import asyncio
 import logging
 import os
 
-import anthropic
+from google import genai
 
 from .config import RetryConfig
 
 logger = logging.getLogger("brain.llm")
 
-DEFAULT_MODEL = "claude-haiku-4-5"
+DEFAULT_MODEL = "gemini-3-flash-preview"
 
-_client: anthropic.AsyncAnthropic | None = None
+_client: genai.Client | None = None
 
 
-def _get_client() -> anthropic.AsyncAnthropic:
-    """Lazy singleton for the Anthropic async client."""
+def _get_client() -> genai.Client:
+    """Lazy singleton for the Google GenAI client."""
     global _client
     if _client is None:
-        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        api_key = os.environ.get("GOOGLE_API_KEY")
         if not api_key:
-            raise RuntimeError("LLM unavailable: no ANTHROPIC_API_KEY.")
-        _client = anthropic.AsyncAnthropic(api_key=api_key)
-        logger.info("Anthropic LLM client initialized.")
+            raise RuntimeError("LLM unavailable: no GOOGLE_API_KEY.")
+        _client = genai.Client(api_key=api_key)
+        logger.info("Gemini LLM client initialized (model: %s).", DEFAULT_MODEL)
     return _client
 
 
@@ -39,13 +40,16 @@ async def llm_call(
 ) -> str:
     """Single LLM call. Returns the text response."""
     client = _get_client()
-    response = await client.messages.create(
+    response = await asyncio.to_thread(
+        client.models.generate_content,
         model=model,
-        max_tokens=max_tokens,
-        temperature=temperature,
-        messages=[{"role": "user", "content": prompt}],
+        contents=prompt,
+        config=genai.types.GenerateContentConfig(
+            max_output_tokens=max_tokens,
+            temperature=temperature,
+        ),
     )
-    return response.content[0].text.strip()
+    return response.text.strip()
 
 
 async def retry_llm_call(

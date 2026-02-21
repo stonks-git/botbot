@@ -7,27 +7,6 @@
 
 ## Previous Sessions
 
-### SESSION 2026-02-21 (#9) - Phase 6: DMN / Idle Loop
-
-**STATUS:** DONE
-
-**What was done:**
-1. Created `brain/src/rumination.py` — RuminationThread dataclass + RuminationManager (thread lifecycle, persistence, terminal conditions: max 50 cycles, gut flat, random pop)
-2. Created `brain/src/dmn_store.py` — AttentionCandidate dataclass + ThoughtQueue (in-memory asyncio.Queue per agent_id, ephemeral)
-3. Created `brain/src/idle.py` — IdleLoop with 4 sampling channels (neglected 35%, tension 20%, temporal 20%, introspective 25%), per-agent interval tiers, LLM-powered rumination thread continuation, output channel classification (goal/creative/identity/reflect), repetition filter
-4. Wired into `api.py`: DMN background task in lifespan (same pattern as consolidation), 3 new endpoints (GET /dmn/thoughts, GET /dmn/status, POST /dmn/activity), version 0.5.0
-5. Updated plugin: DMN HTTP clients (brainGetDMNThoughts, brainNotifyActivity, brainGetDMNStatus), dmn_status tool, activity notification in before_agent_start hook
-
-| File | What was done |
-|------|---------------|
-| `brain/src/rumination.py` | New: RuminationThread + RuminationManager (persistence, terminal conditions) |
-| `brain/src/dmn_store.py` | New: AttentionCandidate + ThoughtQueue (ephemeral per-agent queue) |
-| `brain/src/idle.py` | New: IdleLoop (4 channels, thread orchestration, LLM continuation, output classification) |
-| `brain/src/api.py` | Updated: DMN background task, 3 new endpoints, 4 new Pydantic models, version 0.5.0 |
-| `openclaw/extensions/memory-brain/index.ts` | Updated: DMN HTTP clients, dmn_status tool, activity hook |
-
----
-
 ### SESSION 2026-02-21 (#10) - Phase 7: Safety Monitor
 
 **STATUS:** DONE
@@ -42,20 +21,6 @@
    - OutcomeTracker: gate_decision/promotion/demotion recording, forward-linkable, max 2000
 2. Wired into `api.py`: SafetyMonitor created in lifespan, assigned to `_memory_store.safety`, 2 new endpoints (GET /safety/status, GET /safety/audit), version 0.6.0
 3. Wired into `consolidation.py`: `_deep_cycle()` calls `safety.enable_phase_b()` at start, `safety.end_consolidation_cycle(cycle_id)` in finally block
-4. Pre-existing call site in `memory.py:422-431` (`self.safety.check_weight_change()`) now active
-
-**Verifications:**
-- Python syntax check passes for all 3 modified files (safety.py, api.py, consolidation.py)
-- Isolated unit test confirms: HardCeiling blocks at 0.95, DiminishingReturns reduces gain by log2(evidence), audit log captures all events, immutable bypass works
-- 18 total endpoints (2 new safety endpoints)
-
-| File | What was done |
-|------|---------------|
-| `brain/src/safety.py` | New: SafetyEvent, HardCeiling, DiminishingReturns, RateLimiter, TwoGateGuardrail, EntropyMonitor, CircuitBreaker, SafetyMonitor, OutcomeTracker |
-| `brain/src/api.py` | Updated: SafetyMonitor import + lifespan wiring + 2 new endpoints + 2 Pydantic models, version 0.6.0 |
-| `brain/src/consolidation.py` | Updated: _deep_cycle() wires safety Phase B enable/end |
-| `KB/KB_01_architecture.md` | Updated: Phase 7 section, dependency graph with safety.py |
-| `KB/blueprints/v0.3_current_state.md` | Updated: Phase 7 DONE, API surface, dependency graph |
 
 ---
 
@@ -71,16 +36,35 @@
    - `check_all(agent_id)` returns full status dict; `_render_status()` for text display
 2. Wired into `api.py`: import + global + lifespan init, `BootstrapStatusResponse` Pydantic model, `GET /bootstrap/status?agent_id=X` endpoint, version 0.7.0
 
+---
+
+### SESSION 2026-02-21 (#12) - Integration Testing + LLM Switch
+
+**STATUS:** DONE
+
+**What was done:**
+1. Inlined openclaw from git submodule to regular files (repo now self-contained, no upstream dependency)
+2. Docker compose up — postgres + brain services verified healthy
+3. Fixed Dockerfile bug: `/app/state` dir owned by root, brain user (UID 1000) got PermissionError → added `mkdir + chown` before USER switch
+4. Switched LLM backend from Anthropic Haiku to Gemini 3 Flash Preview (D-006: Max subscription OAuth tokens restricted to Claude Code/Claude.ai per Anthropic policy)
+5. Removed `anthropic` from requirements.txt, removed `ANTHROPIC_API_KEY` from docker-compose.yml
+6. Full integration test: all 19/19 endpoints return 200
+
 **Verifications:**
-- Python syntax check passes (bootstrap.py, api.py)
-- 19 total endpoints (1 new bootstrap)
+- All 19 endpoints tested via curl, all return 200
+- Store→retrieve→gate→assemble full cycle works
+- Consolidation deep cycle runs with Gemini Flash (HTTP 200 to generativelanguage.googleapis.com)
+- Safety, DMN, bootstrap all responding correctly
+- Gate correctly buffers trivial content ("The weather is nice today" → buffer)
+- Bootstrap shows 0/10 milestones for new agent with bootstrap prompt
 
 | File | What was done |
 |------|---------------|
-| `brain/src/bootstrap.py` | New: BOOTSTRAP_PROMPT, Milestone, BootstrapReadiness (10 milestone checks) |
-| `brain/src/api.py` | Updated: BootstrapReadiness import + lifespan wiring + 1 new endpoint + Pydantic model, version 0.7.0 |
-| `KB/KB_01_architecture.md` | Updated: Phase 8 section, dependency graph with bootstrap.py |
-| `KB/blueprints/v0.3_current_state.md` | Updated: Phase 8 DONE, API surface, dependency graph |
+| `brain/src/llm.py` | Rewritten: Anthropic → Google Gemini 3 Flash Preview via google-genai SDK |
+| `brain/requirements.txt` | Removed anthropic dependency |
+| `brain/Dockerfile` | Fixed: mkdir + chown /app/state before USER switch |
+| `docker-compose.yml` | Removed ANTHROPIC_API_KEY env var |
+| `KB/KB_01_architecture.md` | Updated: LLM backend, DJ-002, integration status |
 
 ---
 
@@ -94,7 +78,7 @@ BotBot bolts the intuitive-AI cognitive architecture (memory with Beta-distribut
 
 | Task ID | Status |
 |---------|--------|
-| T-P8 | DONE — Bootstrap Readiness |
+| Integration testing | DONE — all 19/19 endpoints pass |
 
 ## Blockers or open questions
 
@@ -102,22 +86,23 @@ BotBot bolts the intuitive-AI cognitive architecture (memory with Beta-distribut
 |------------------|--------|
 | GOOGLE_API_KEY needed for embeddings | RESOLVED — key present in env, Gemini client initializes |
 | halfvec deserialization from asyncpg | RESOLVED — using `embedding::float4[]` cast in SQL returns Python list, then np.array() |
+| Anthropic OAuth for Max subscription | RESOLVED — policy prohibits non-Claude-Code use, switched to Gemini Flash (D-006) |
 
 ---
 
 ## Git Status
 
 - **Branch:** main
-- **Last commit:** 37d2fb8 Phases 2-5: Gate, Context Assembly, Gut Feeling, Consolidation Engine
-- **Modified (tracked):** KB/KB_01_architecture.md, KB/blueprints/v0.3_current_state.md, brain/src/api.py, brain/src/consolidation.py, state/devlog.ndjson, state/handoff.md, state/roadmap.json
-- **New (untracked):** brain/src/bootstrap.py, brain/src/safety.py, brain/src/rumination.py, brain/src/dmn_store.py, brain/src/idle.py
+- **Last commit:** 930fc54 Inline openclaw: convert submodule to regular files for portable deployment
+- **Modified (tracked):** brain/src/llm.py, brain/requirements.txt, brain/Dockerfile, docker-compose.yml
+- **New (untracked):** .env, brain-state/
 
 ---
 
 ## Memory Marker
 
 ```
-MEMORY_MARKER: 2026-02-21T19:47:00+02:00 | T-P8 DONE | bootstrap.py created (10 milestones, BOOTSTRAP_PROMPT, BootstrapReadiness), api.py v0.7.0 | All brain phases (0-8) complete
+MEMORY_MARKER: 2026-02-21T22:40:00+02:00 | Integration test DONE | 19/19 endpoints pass, LLM switched to Gemini Flash (D-006), Dockerfile /app/state perms fixed | Next: commit, plugin bootstrap wiring, deploy
 ```
 
 ---
@@ -125,8 +110,9 @@ MEMORY_MARKER: 2026-02-21T19:47:00+02:00 | T-P8 DONE | bootstrap.py created (10 
 ## Next Session Bootstrap
 
 1. Read `KB/blueprints/v0.3_current_state.md` — **the single source of truth** for project state
-2. All brain phases (0-8) are complete — 19 endpoints, 13 modules
-3. Next steps: integration testing, docker compose up, end-to-end verification, plugin wiring for bootstrap prompt injection
+2. All brain phases (0-8) complete + integration tested — 19 endpoints, all passing
+3. LLM is Gemini 3 Flash Preview (not Anthropic) — see D-006
+4. Next steps: commit integration changes, plugin bootstrap prompt wiring, deploy to production
 
 ---
 

@@ -11,6 +11,8 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY src/ /app/src/
 
+RUN mkdir -p /app/state && chown brain:brain /app/state
+
 USER brain
 WORKDIR /app
 

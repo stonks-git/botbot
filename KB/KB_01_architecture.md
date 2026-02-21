@@ -20,9 +20,20 @@ BotBot integrates the intuitive-AI cognitive architecture into OpenClaw via a Py
 
 **Embedding model**: `gemini-embedding-001` at 3072 dimensions (max Matryoshka resolution)
 
-**Key files**: `brain/src/schema.sql` (DB schema), `brain/src/api.py` (HTTP API), `docker-compose.yml` (orchestration)
+**LLM model**: `gemini-3-flash-preview` via `google-genai` SDK (D-006: switched from Anthropic Haiku — Max subscription OAuth tokens restricted to Claude Code/Claude.ai only). Single `GOOGLE_API_KEY` for both embeddings and LLM.
+
+**Key files**: `brain/src/schema.sql` (DB schema), `brain/src/api.py` (HTTP API), `brain/src/llm.py` (LLM wrapper), `docker-compose.yml` (orchestration)
+
+**Integration status**: All 19 endpoints verified working via docker compose (2026-02-21). Store→retrieve→gate→assemble cycle, consolidation deep cycle, safety, DMN, bootstrap all operational.
 
 See `KB/blueprints/v0.3_current_state.md` for the current blueprint (done phases + remaining plan).
+
+## Decision Journal
+
+| ID | Tag | Decision | Supersedes | Date |
+|----|-----|----------|------------|------|
+| DJ-001 | memory | L0/L1 layers discarded for unified memory | — | 2026-02-19 |
+| DJ-002 | llm | Anthropic Haiku replaced by Gemini 2.0 Flash (Max OAuth restricted) | — | 2026-02-21 |
 
 ## Phase 1: Memory Core (implemented)
 
