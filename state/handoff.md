@@ -7,90 +7,80 @@
 
 ## Previous Sessions
 
-### SESSION 2026-02-18/19 (#5+6) - Phase 3: Context Assembly + Unified Memory Rework
+### SESSION 2026-02-21 (#9) - Phase 6: DMN / Idle Loop
 
 **STATUS:** DONE
 
 **What was done:**
-1. Initially built layers.py (L0/L1 JSON), context_assembly.py, api.py endpoints, plugin tools
-2. User feedback: identity should emerge from unified memory weights, not L0/L1 files (D-005)
-3. Created v0.2 rework blueprint documenting exhaustive modification plan
-4. Executed rework:
-   - DELETED brain/src/layers.py
-   - Rewrote context_assembly.py: removed `layers` param, added `render_identity_hash()` and `render_identity_full()` querying top-N memories by weight center from DB
-   - Rewrote api.py: removed LayerStore imports/cache/helper, added `_get_identity_embeddings()` (DB query with `embedding::float4[]` cast), removed PUT /identity endpoint + IdentityUpdateRequest model, rewired gate to use DB identity embeddings
-   - Updated plugin: removed identity_update tool + brainUpdateIdentity(), updated introspect description
-
-**Verifications:**
-- Python syntax check passes for api.py, context_assembly.py
-- No LayerStore/layers.py/identity_update references in codebase (only historical comments)
-- layers.py file deleted from disk
-- Gate wiring: `_get_identity_embeddings()` queries top-N memories by weight center, passes to ExitGate
-- Empty DB: returns None → gate falls back to "peripheral" (same pre-Phase 3 behavior)
+1. Created `brain/src/rumination.py` — RuminationThread dataclass + RuminationManager (thread lifecycle, persistence, terminal conditions: max 50 cycles, gut flat, random pop)
+2. Created `brain/src/dmn_store.py` — AttentionCandidate dataclass + ThoughtQueue (in-memory asyncio.Queue per agent_id, ephemeral)
+3. Created `brain/src/idle.py` — IdleLoop with 4 sampling channels (neglected 35%, tension 20%, temporal 20%, introspective 25%), per-agent interval tiers, LLM-powered rumination thread continuation, output channel classification (goal/creative/identity/reflect), repetition filter
+4. Wired into `api.py`: DMN background task in lifespan (same pattern as consolidation), 3 new endpoints (GET /dmn/thoughts, GET /dmn/status, POST /dmn/activity), version 0.5.0
+5. Updated plugin: DMN HTTP clients (brainGetDMNThoughts, brainNotifyActivity, brainGetDMNStatus), dmn_status tool, activity notification in before_agent_start hook
 
 | File | What was done |
 |------|---------------|
-| `brain/src/layers.py` | DELETED (D-005: unified memory) |
-| `brain/src/context_assembly.py` | Rewritten: removed layers param, added render_identity_hash/full from DB, 3-track assembly unchanged |
-| `brain/src/api.py` | Rewritten: _get_identity_embeddings from DB, removed LayerStore/PUT identity, rewired gate, version 0.2.0 |
-| `brain/src/gate.py` | Minor: updated comment (LayerStore → top-N identity memory embeddings from DB) |
-| `openclaw/extensions/memory-brain/index.ts` | Removed identity_update tool + brainUpdateIdentity(), updated header + introspect description |
-| `KB/blueprints/v0.2_unified_memory_rework.md` | New: exhaustive rework plan (created prior session) |
-| `state/roadmap.json` | T-P3 status doing → done, D-005 decision added |
+| `brain/src/rumination.py` | New: RuminationThread + RuminationManager (persistence, terminal conditions) |
+| `brain/src/dmn_store.py` | New: AttentionCandidate + ThoughtQueue (ephemeral per-agent queue) |
+| `brain/src/idle.py` | New: IdleLoop (4 channels, thread orchestration, LLM continuation, output classification) |
+| `brain/src/api.py` | Updated: DMN background task, 3 new endpoints, 4 new Pydantic models, version 0.5.0 |
+| `openclaw/extensions/memory-brain/index.ts` | Updated: DMN HTTP clients, dmn_status tool, activity hook |
 
 ---
 
-### SESSION 2026-02-19 (#7) - Phase 4: Gut Feeling
+### SESSION 2026-02-21 (#10) - Phase 7: Safety Monitor
 
 **STATUS:** DONE
 
 **What was done:**
-1. Created `brain/src/gut.py` with two-centroid emotional model (D-005 adapted)
-2. Wired gut into api.py (gate + context assembly + 2 new endpoints, version 0.3.0)
-3. Updated context_assembly.py + plugin (gut_check tool)
+1. Created `brain/src/safety.py` — standalone safety module (no brain module deps, math+logging+uuid only):
+   - SafetyEvent dataclass + module-level `_audit_log` (max 1000), `log_safety_event()`, `get_audit_log()`
+   - Phase A (always): HardCeiling (MAX_CENTER=0.95, MAX_GOAL_BUDGET_FRACTION=0.40) + DiminishingReturns (gain / log2(evidence))
+   - Phase B (consolidation): RateLimiter (MAX_CHANGE_PER_CYCLE=0.10) + TwoGateGuardrail (evidence quality + 50 changes/cycle)
+   - Phase C (mature): EntropyMonitor (ENTROPY_FLOOR=2.0 bits, 20-bin histogram) + CircuitBreaker (MAX_CONSECUTIVE=5)
+   - SafetyMonitor coordinator: synchronous `check_weight_change()` -> (allowed, adj_alpha, adj_beta, reasons)
+   - OutcomeTracker: gate_decision/promotion/demotion recording, forward-linkable, max 2000
+2. Wired into `api.py`: SafetyMonitor created in lifespan, assigned to `_memory_store.safety`, 2 new endpoints (GET /safety/status, GET /safety/audit), version 0.6.0
+3. Wired into `consolidation.py`: `_deep_cycle()` calls `safety.enable_phase_b()` at start, `safety.end_consolidation_cycle(cycle_id)` in finally block
+4. Pre-existing call site in `memory.py:422-431` (`self.safety.check_weight_change()`) now active
+
+**Verifications:**
+- Python syntax check passes for all 3 modified files (safety.py, api.py, consolidation.py)
+- Isolated unit test confirms: HardCeiling blocks at 0.95, DiminishingReturns reduces gain by log2(evidence), audit log captures all events, immutable bypass works
+- 18 total endpoints (2 new safety endpoints)
 
 | File | What was done |
 |------|---------------|
-| `brain/src/gut.py` | New: GutFeeling (EMA attention, DB-weighted subconscious, GutDelta, persistence) |
-| `brain/src/api.py` | Updated: gut cache, new endpoints, gate wiring, context assembly wiring, version 0.3.0 |
-| `brain/src/context_assembly.py` | Updated: [COGNITIVE STATE] section header |
-| `openclaw/extensions/memory-brain/index.ts` | Updated: gut_check tool, brainGetGutState/brainUpdateAttention clients |
+| `brain/src/safety.py` | New: SafetyEvent, HardCeiling, DiminishingReturns, RateLimiter, TwoGateGuardrail, EntropyMonitor, CircuitBreaker, SafetyMonitor, OutcomeTracker |
+| `brain/src/api.py` | Updated: SafetyMonitor import + lifespan wiring + 2 new endpoints + 2 Pydantic models, version 0.6.0 |
+| `brain/src/consolidation.py` | Updated: _deep_cycle() wires safety Phase B enable/end |
+| `KB/KB_01_architecture.md` | Updated: Phase 7 section, dependency graph with safety.py |
+| `KB/blueprints/v0.3_current_state.md` | Updated: Phase 7 DONE, API surface, dependency graph |
 
 ---
 
-### SESSION 2026-02-19 (#8) - Phase 5: Consolidation Engine
+### SESSION 2026-02-21 (#11) - Phase 8: Bootstrap Readiness
 
 **STATUS:** DONE
 
 **What was done:**
-1. Created `brain/src/llm.py` -- Anthropic Claude wrapper (claude-haiku-4-5) with retry_llm_call
-2. Created `brain/src/consolidation.py` -- full consolidation engine:
-   - ConstantConsolidation (Tier 1): _decay_tick (5min, beta+=0.01 for stale), _contradiction_scan (10min, LLM pair check, store tensions), _pattern_detection (15min, greedy cosine clustering)
-   - DeepConsolidation (Tier 2): _merge_and_insight (LLM questions+insights+narratives), _promote_patterns (D-005 direct SQL alpha updates), _decay_and_reconsolidate (beta+=1.0 for 90d stale + insight revalidation), _tune_parameters (Shannon entropy), _contextual_retrieval (WHO/WHEN/WHY preambles + re-embed)
-   - ConsolidationEngine wrapper (asyncio.gather both tiers, trigger + status)
-   - Error isolation per operation, multi-agent via SELECT DISTINCT agent_id
-3. Wired into `api.py`: background task in lifespan, GET /consolidation/status, POST /consolidation/trigger, version 0.4.0
-4. Updated plugin: consolidation_status + consolidation_trigger tools + HTTP clients
+1. Created `brain/src/bootstrap.py` — stateless milestone checker (no background task):
+   - `BOOTSTRAP_PROMPT` constant for newborn agents
+   - `Milestone` dataclass (name, description, achieved, achieved_at)
+   - `BootstrapReadiness(pool)` with 10 DB-direct milestone checks via `pool.fetchval()`
+   - `check_all(agent_id)` returns full status dict; `_render_status()` for text display
+2. Wired into `api.py`: import + global + lifespan init, `BootstrapStatusResponse` Pydantic model, `GET /bootstrap/status?agent_id=X` endpoint, version 0.7.0
 
 **Verifications:**
-- Python syntax check passes for llm.py, consolidation.py, api.py
-- No LayerStore/layers.py code references (D-005)
-- No TODO/placeholder in new code
-- 9 consolidation_log writes, 2 store_insight calls (memory_supersedes linking)
+- Python syntax check passes (bootstrap.py, api.py)
+- 19 total endpoints (1 new bootstrap)
 
 | File | What was done |
 |------|---------------|
-| `brain/src/llm.py` | New: Anthropic Claude wrapper with retry |
-| `brain/src/consolidation.py` | New: Tier 1 + Tier 2 consolidation engine |
-| `brain/src/api.py` | Updated: consolidation background task, 2 new endpoints, version 0.4.0 |
-| `openclaw/extensions/memory-brain/index.ts` | Updated: consolidation_status + consolidation_trigger tools |
-
-**Post-implementation audit (5 fixes):**
-- v0.3 API Surface: added 4 missing endpoints (context/attention, gut/{agent_id}, consolidation/status, consolidation/trigger)
-- v0.3 + KB_01 dependency graph: added asyncpg to consolidation.py deps
-- consolidation_log count: corrected 10 to 9 across handoff, devlog, KB_01, v0.3
-- roadmap T-P4 deliverable: corrected `GET /gut/state` to `GET /gut/{agent_id}`
-- roadmap Q-001 status: corrected `open` to `answered`
+| `brain/src/bootstrap.py` | New: BOOTSTRAP_PROMPT, Milestone, BootstrapReadiness (10 milestone checks) |
+| `brain/src/api.py` | Updated: BootstrapReadiness import + lifespan wiring + 1 new endpoint + Pydantic model, version 0.7.0 |
+| `KB/KB_01_architecture.md` | Updated: Phase 8 section, dependency graph with bootstrap.py |
+| `KB/blueprints/v0.3_current_state.md` | Updated: Phase 8 DONE, API surface, dependency graph |
 
 ---
 
@@ -104,8 +94,7 @@ BotBot bolts the intuitive-AI cognitive architecture (memory with Beta-distribut
 
 | Task ID | Status |
 |---------|--------|
-| T-P6 | NEXT — DMN / Idle Loop |
-| T-P7 | AFTER — Safety Monitor |
+| T-P8 | DONE — Bootstrap Readiness |
 
 ## Blockers or open questions
 
@@ -119,27 +108,25 @@ BotBot bolts the intuitive-AI cognitive architecture (memory with Beta-distribut
 ## Git Status
 
 - **Branch:** main
-- **Last commit:** 446036c Phase 1: Memory Core — store, retrieve, embed, plugin
-- **Modified (tracked):** KB/KB_01_architecture.md, KB/KB_index.md, KB/blueprints/BLUEPRINT_INDEX.md, KB/blueprints/v0.1_brain_integration_plan.md, brain/src/api.py, state/devlog.ndjson, state/handoff.md, state/roadmap.json
-- **New (untracked):** brain/src/llm.py, brain/src/consolidation.py, brain/src/context_assembly.py, brain/src/gate.py, brain/src/gut.py, KB/blueprints/v0.2_unified_memory_rework.md, KB/blueprints/v0.3_current_state.md
+- **Last commit:** 37d2fb8 Phases 2-5: Gate, Context Assembly, Gut Feeling, Consolidation Engine
+- **Modified (tracked):** KB/KB_01_architecture.md, KB/blueprints/v0.3_current_state.md, brain/src/api.py, brain/src/consolidation.py, state/devlog.ndjson, state/handoff.md, state/roadmap.json
+- **New (untracked):** brain/src/bootstrap.py, brain/src/safety.py, brain/src/rumination.py, brain/src/dmn_store.py, brain/src/idle.py
 
 ---
 
 ## Memory Marker
 
 ```
-MEMORY_MARKER: 2026-02-19T21:30:00+02:00 | T-P5 DONE | llm.py + consolidation.py created, api.py wired, plugin updated | Next: T-P6 DMN/Idle Loop
+MEMORY_MARKER: 2026-02-21T19:47:00+02:00 | T-P8 DONE | bootstrap.py created (10 milestones, BOOTSTRAP_PROMPT, BootstrapReadiness), api.py v0.7.0 | All brain phases (0-8) complete
 ```
 
 ---
 
 ## Next Session Bootstrap
 
-1. Read `KB/blueprints/v0.3_current_state.md` — **the single source of truth** for project state + what's next
-2. Read `KB/KB_02_intuitive_ai_reference.md` idle + rumination sections — source reference for DMN port
-3. Implement Phase 6 (DMN / Idle Loop): `brain/src/idle.py` + `brain/src/rumination.py` + `brain/src/dmn_store.py`
-4. 4 sampling channels: neglected (35%), tension (20%), temporal (20%), introspective (25%)
-5. Plugin: background poll every 30s, queue as self-prompts when idle
+1. Read `KB/blueprints/v0.3_current_state.md` — **the single source of truth** for project state
+2. All brain phases (0-8) are complete — 19 endpoints, 13 modules
+3. Next steps: integration testing, docker compose up, end-to-end verification, plugin wiring for bootstrap prompt injection
 
 ---
 
@@ -148,5 +135,8 @@ MEMORY_MARKER: 2026-02-19T21:30:00+02:00 | T-P5 DONE | llm.py + consolidation.py
 - [x] devlog entry added for each change
 - [x] Session section filled (what was done, verifications, files touched)
 - [x] **KB updated** if code was modified + `kb_update` devlog entry
+- [x] **Blueprint updated** if scaffolding/architecture changed + `blueprint` devlog entry
+- [x] **Decision Journal entry** if any decision was superseded + `dj_entry` devlog entry
+- [x] **Schema Log updated** if DB migrations were created
 - [x] `python3 taskmaster.py validate` exits 0
 - [x] Keep only last 3 sessions (older ones archived in git)

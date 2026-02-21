@@ -23,7 +23,7 @@ All auditors are available as **Claude Code subagents** (user-level, available i
 | `audit-code-quality` | God objects, duplication, naming, error handling | Read, Grep, Glob, WebSearch | After archeologist - code is now in right place |
 | `audit-frontend` | Responsive, accessibility, touch targets, UI consistency | Read, Grep, Glob, WebSearch | After backend is stable |
 | `audit-ops` | Backups, SSL, deployment, monitoring, disaster recovery | Read, Grep, Glob, WebSearch, Bash | When scaling or after major changes |
-| `audit-prospector` | Pattern scout - find conventions BEFORE coding | Read, Grep, Glob, WebSearch | Before implementing any new feature |
+| `pre-build-explorer` | Pattern scout - find conventions BEFORE coding | Read, Grep, Glob, WebSearch | Before implementing any new feature |
 
 ## Hard Rules (NEVER VIOLATE)
 
@@ -76,7 +76,7 @@ All auditors MUST apply this protocol for **every issue/process type** found:
 | 4 | `audit-code-quality` | Clean up the restructured code | After archeologist |
 | 5 | `audit-frontend` | UI/UX, responsive, accessibility | After backend is stable |
 | 6 | `audit-ops` | Deployment, backups, environments | When scaling |
-| -- | `audit-prospector` | Pattern scout (not part of audit sequence) | Before implementing any new feature |
+| -- | `pre-build-explorer` | Pattern scout (not part of audit sequence) | Before implementing any new feature |
 
 ## Orchestration Protocol
 

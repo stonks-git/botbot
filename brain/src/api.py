@@ -12,9 +12,13 @@ from pydantic import BaseModel, Field
 from .consolidation import ConsolidationEngine
 from .context_assembly import assemble_context, render_identity_full, render_identity_hash, render_system_prompt
 from .db import close_pool, get_pool, init_pool
+from .dmn_store import ThoughtQueue
 from .gate import DROP, BUFFER, PERSIST, PERSIST_FLAG, PERSIST_HIGH, REINFORCE, SKIP, EntryGate, ExitGate
 from .gut import GutFeeling
+from .idle import IdleLoop
 from .memory import MemoryStore
+from .bootstrap import BootstrapReadiness
+from .safety import SafetyMonitor, get_audit_log
 
 logging.basicConfig(
     level=logging.INFO,
@@ -29,6 +33,11 @@ _exit_gate: ExitGate | None = None
 _gut_feelings: dict[str, GutFeeling] = {}
 _consolidation_engine: ConsolidationEngine | None = None
 _consolidation_shutdown: asyncio.Event | None = None
+_idle_loop: IdleLoop | None = None
+_thought_queue: ThoughtQueue | None = None
+_idle_shutdown: asyncio.Event | None = None
+_safety_monitor: SafetyMonitor | None = None
+_bootstrap: BootstrapReadiness | None = None
 
 
 def _get_gut(agent_id: str) -> GutFeeling:
@@ -40,14 +49,19 @@ def _get_gut(agent_id: str) -> GutFeeling:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup: connect DB + init MemoryStore + start consolidation. Shutdown: stop all."""
+    """Startup: connect DB + init MemoryStore + start consolidation + DMN. Shutdown: stop all."""
     global _start_time, _memory_store, _entry_gate, _exit_gate
     global _consolidation_engine, _consolidation_shutdown
+    global _idle_loop, _thought_queue, _idle_shutdown
+    global _safety_monitor, _bootstrap
     _start_time = time.time()
     pool = await init_pool()
     _memory_store = MemoryStore(pool)
+    _safety_monitor = SafetyMonitor()
+    _memory_store.safety = _safety_monitor
     _entry_gate = EntryGate()
     _exit_gate = ExitGate()
+    _bootstrap = BootstrapReadiness(pool)
 
     # Start consolidation engine as background task
     _consolidation_shutdown = asyncio.Event()
@@ -55,9 +69,24 @@ async def lifespan(app: FastAPI):
     consolidation_task = asyncio.create_task(
         _consolidation_engine.run(_consolidation_shutdown)
     )
-    logger.info("Brain service started (consolidation engine active).")
+
+    # Start DMN idle loop as background task
+    _thought_queue = ThoughtQueue()
+    _idle_shutdown = asyncio.Event()
+    _idle_loop = IdleLoop(pool, _memory_store, _thought_queue, _get_gut)
+    idle_task = asyncio.create_task(_idle_loop.run(_idle_shutdown))
+    logger.info("Brain service started (consolidation + DMN active).")
 
     yield
+
+    # Shutdown DMN
+    if _idle_shutdown:
+        _idle_shutdown.set()
+    idle_task.cancel()
+    try:
+        await idle_task
+    except asyncio.CancelledError:
+        pass
 
     # Shutdown consolidation
     if _consolidation_shutdown:
@@ -72,11 +101,15 @@ async def lifespan(app: FastAPI):
     _entry_gate = None
     _exit_gate = None
     _consolidation_engine = None
+    _idle_loop = None
+    _thought_queue = None
+    _safety_monitor = None
+    _bootstrap = None
     await close_pool()
     logger.info("Brain service stopped.")
 
 
-app = FastAPI(title="Brain Service", version="0.4.0", lifespan=lifespan)
+app = FastAPI(title="Brain Service", version="0.7.0", lifespan=lifespan)
 
 
 def _store() -> MemoryStore:
@@ -260,6 +293,29 @@ class ConsolidationTriggerResponse(BaseModel):
     agent_id: str
     triggered: bool
     message: str
+
+
+class DMNThoughtResponse(BaseModel):
+    agent_id: str
+    thoughts: list[dict] = Field(default_factory=list)
+    count: int
+
+
+class DMNStatusResponse(BaseModel):
+    running: bool
+    heartbeat_counts: dict = Field(default_factory=dict)
+    queue_sizes: dict = Field(default_factory=dict)
+    active_threads: dict = Field(default_factory=dict)
+
+
+class DMNActivityRequest(BaseModel):
+    agent_id: str
+
+
+class DMNActivityResponse(BaseModel):
+    agent_id: str
+    acknowledged: bool
+    idle_seconds: float
 
 
 # ── Endpoints ──────────────────────────────────────────────────────────
@@ -646,3 +702,94 @@ async def consolidation_trigger(req: ConsolidationTriggerRequest):
         triggered=True,
         message=f"Deep consolidation triggered for agent {req.agent_id}.",
     )
+
+
+# ── DMN / Idle Loop ──────────────────────────────────────────────────
+
+
+@app.get("/dmn/thoughts", response_model=DMNThoughtResponse)
+async def dmn_thoughts(agent_id: str = Query(..., description="Agent ID")):
+    """Drain pending DMN thoughts for an agent."""
+    if _thought_queue is None:
+        raise HTTPException(status_code=503, detail="DMN not initialized.")
+    thoughts = _thought_queue.get_thoughts(agent_id)
+    return DMNThoughtResponse(
+        agent_id=agent_id,
+        thoughts=[t.to_dict() for t in thoughts],
+        count=len(thoughts),
+    )
+
+
+@app.get("/dmn/status", response_model=DMNStatusResponse)
+async def dmn_status():
+    """Get DMN idle loop status."""
+    if _idle_loop is None:
+        return DMNStatusResponse(running=False)
+    return DMNStatusResponse(**_idle_loop.status())
+
+
+@app.post("/dmn/activity", response_model=DMNActivityResponse)
+async def dmn_activity(req: DMNActivityRequest):
+    """Notify brain of user activity — resets idle timer for DMN."""
+    if _idle_loop is None:
+        raise HTTPException(status_code=503, detail="DMN not initialized.")
+    _idle_loop.notify_activity(req.agent_id)
+    idle_secs = time.time() - _idle_loop.last_activity.get(req.agent_id, time.time())
+    return DMNActivityResponse(
+        agent_id=req.agent_id,
+        acknowledged=True,
+        idle_seconds=max(0.0, idle_secs),
+    )
+
+
+# ── Safety Monitor ──────────────────────────────────────────────────
+
+
+class SafetyStatusResponse(BaseModel):
+    phase_a: dict = Field(default_factory=dict)
+    phase_b: dict = Field(default_factory=dict)
+    phase_c: dict = Field(default_factory=dict)
+    audit_log_size: int = 0
+
+
+class SafetyAuditResponse(BaseModel):
+    events: list[dict] = Field(default_factory=list)
+    count: int = 0
+
+
+@app.get("/safety/status", response_model=SafetyStatusResponse)
+async def safety_status():
+    """Get current safety monitor status."""
+    if _safety_monitor is None:
+        return SafetyStatusResponse()
+    return SafetyStatusResponse(**_safety_monitor.status())
+
+
+@app.get("/safety/audit", response_model=SafetyAuditResponse)
+async def safety_audit(limit: int = Query(default=50, ge=1, le=1000)):
+    """Get recent safety audit events."""
+    events = get_audit_log()
+    recent = events[-limit:]
+    return SafetyAuditResponse(events=recent, count=len(events))
+
+
+# ── Bootstrap Readiness ─────────────────────────────────────────────
+
+
+class BootstrapStatusResponse(BaseModel):
+    agent_id: str = ""
+    milestones: list[dict] = Field(default_factory=list)
+    achieved: int = 0
+    total: int = 10
+    ready: bool = False
+    bootstrap_prompt: str | None = None
+    status_text: str = ""
+
+
+@app.get("/bootstrap/status", response_model=BootstrapStatusResponse)
+async def bootstrap_status(agent_id: str = Query(..., description="Agent ID")):
+    """Check bootstrap readiness milestones for an agent."""
+    if _bootstrap is None:
+        raise HTTPException(status_code=503, detail="Bootstrap checker not initialized.")
+    result = await _bootstrap.check_all(agent_id)
+    return BootstrapStatusResponse(**result)

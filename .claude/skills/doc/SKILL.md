@@ -5,6 +5,8 @@ description: Document session changes in tracking files (devlog, handoff, KB, ro
 
 # Document Session
 
+<!-- Keep event types in sync with CLAUDE.md (Devlog section) and taskmaster.py (ALLOWED_DEVLOG_EVENTS). -->
+
 When the user asks to document, follow these steps **IN ORDER**:
 
 ## 1. devlog.ndjson (MANDATORY)
@@ -64,7 +66,13 @@ If any decision was superseded or amended:
 3. Update decision status to `superseded` in `state/roadmap.json`
 4. Add devlog entry with `event: dj_entry`
 
-## 6. Git Status (MANDATORY)
+## 6. Schema Log (IF DB MIGRATIONS CREATED)
+
+If new database migrations were created during this task:
+1. Update `state/schema_log.md` — add new migration to the table, update counts
+2. Verify: check version control for new migration files
+
+## 7. Git Status (MANDATORY)
 
 Run git commands and update handoff.md:
 
@@ -73,7 +81,7 @@ git status --short
 git log --oneline -3
 ```
 
-## 7. roadmap.json (IF APPLICABLE)
+## 8. roadmap.json (IF APPLICABLE)
 
 Update `state/roadmap.json` only if:
 - A task changes status (doing -> done)
@@ -81,7 +89,7 @@ Update `state/roadmap.json` only if:
 - Dependencies changed
 - Decision status changed (including superseded)
 
-## 8. VALIDATE (MANDATORY)
+## 9. VALIDATE (MANDATORY)
 
 ```bash
 python3 taskmaster.py validate
@@ -89,7 +97,7 @@ python3 taskmaster.py validate
 
 Must exit 0. If it doesn't, fix the issues before finishing.
 
-## 9. FINAL CHECKLIST
+## 10. FINAL CHECKLIST
 
 **STOP! Don't commit until you verify ALL:**
 
@@ -99,6 +107,7 @@ Must exit 0. If it doesn't, fix the issues before finishing.
 - [ ] `kb_update` entry in devlog (if KB was updated)
 - [ ] **Blueprint updated** - if architecture changed
 - [ ] **Decision Journal entry** - if decision was superseded
+- [ ] **Schema Log updated** - if DB migrations were created
 - [ ] Tags used exist in charter.json taxonomy
 - [ ] `taskmaster validate` - exit 0
 
@@ -115,10 +124,11 @@ Must exit 0. If it doesn't, fix the issues before finishing.
    -> New version file + update index + devlog entry
 6. GATE: Add Decision Journal entry if decision was superseded
    -> DJ-XXX entry + update roadmap status + devlog entry
-7. Check git status, add to handoff
-8. Update roadmap if task status changed
-9. Run `python3 taskmaster.py validate` — exit 0
-10. CHECKLIST COMPLETE? -> tell user documentation is done
+7. GATE: Update schema_log.md if DB migrations created
+8. Check git status, add to handoff
+9. Update roadmap if task status changed
+10. Run `python3 taskmaster.py validate` — exit 0
+11. CHECKLIST COMPLETE? -> tell user documentation is done
 ```
 
 ## Timestamp format

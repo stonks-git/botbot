@@ -330,6 +330,136 @@ consolidation.py     <- llm, memory, activation (cosine_similarity), numpy, asyn
 api.py               <- memory, gate, context_assembly, gut, consolidation, db, numpy
 ```
 
+## Phase 6: DMN / Idle Loop (implemented)
+
+**Brain modules:**
+- `brain/src/rumination.py` — persistent thought threads:
+  - `RuminationThread` dataclass: topic, seed_memory_id, seed_content, history (max 10 entries), cycle_count, last_gut_magnitude, resolved, resolution_reason
+  - `should_random_pop()`: probability = `0.10 + (cycle_count * 0.02)`, capped at 0.5
+  - `render_for_prompt()`: formats thread for LLM continuation (last 5 history + "THREAD_RESOLVED" instruction)
+  - `RuminationManager`: manages active thread + completed archive (last 20). Methods: `start_thread()`, `end_thread(reason)`, `continue_thread(summary, gut_magnitude)` (checks terminal: max 50 cycles, gut < 0.1 after 3+), `save()`/`load()`.
+  - Persistence: `/app/state/{agent_id}/rumination_state.json` (same pattern as gut.py)
+
+- `brain/src/dmn_store.py` — ephemeral thought queue:
+  - `AttentionCandidate` dataclass: thought, channel (`DMN/goal`, `DMN/creative`, `DMN/identity`, `DMN/reflect`), urgency (always 0.2), memory_id, timestamp
+  - `ThoughtQueue`: `defaultdict(asyncio.Queue)` per agent_id. Methods: `put_thought()`, `get_thoughts()` (non-blocking drain), `queue_size()`, `all_queue_sizes()`
+  - In-memory only — no persistence. Thoughts are ephemeral and opportunistic.
+
+- `brain/src/idle.py` — DMN idle loop:
+  - `IdleLoop`: main background loop (same pattern as consolidation.py — `asyncio.wait_for(shutdown_event.wait(), timeout=...)`)
+  - Constructor: `IdleLoop(pool, memory_store, thought_queue, gut_getter)`. `gut_getter` is `_get_gut` callable injected from api.py to avoid circular imports.
+  - Per-agent heartbeat intervals based on idle duration: <10min → 60s, 10-60min → 300s, 1-4h → 900s, 4h+ → 1800s. Loop sleeps at 30s, skips agents whose interval hasn't elapsed.
+  - **4 Sampling Channels** (roll [0-1)):
+    - Neglected (35%): high weight center > 0.5, last_accessed > 7 days ago
+    - Tension (20%): high-weight seed + moderately similar partner (sim 0.3-0.7, different type)
+    - Temporal (20%): old memories (created > 30 days ago)
+    - Introspective (25%): type IN (reflection, narrative, preference, tension), center > 0.6
+  - **Output channel classification** (`_classify_channel`):
+    1. Goal: keyword overlap ≥ 3 with top-5 high-weight narrative/reflection memories → `DMN/goal`
+    2. Creative: `spread_activation(hops=2)` via co-access network → `DMN/creative`
+    3. Identity: reflective memory types → `DMN/identity`
+    4. Default: `DMN/reflect`
+  - **Thread lifecycle**: `_start_new_thread()` calls LLM (temperature=0.6), `_continue_thread()` calls LLM (temperature=0.5, checks for "THREAD_RESOLVED")
+  - **Repetition filter**: `_is_repetitive()` checks thought[:50] against last 5 topics per agent
+  - D-005 adaptation: goals from DB query (high-weight narrative/reflection), not LayerStore
+
+**API endpoints** (in `brain/src/api.py`, version 0.5.0):
+```
+GET  /dmn/thoughts?agent_id=X
+  Response (DMNThoughtResponse): { agent_id, thoughts: [{ thought, channel, urgency, memory_id, timestamp }], count }
+
+GET  /dmn/status
+  Response (DMNStatusResponse): { running, heartbeat_counts, queue_sizes, active_threads }
+
+POST /dmn/activity
+  Request  (DMNActivityRequest):  { agent_id }
+  Response (DMNActivityResponse): { agent_id, acknowledged, idle_seconds }
+```
+
+**Plugin update** (`openclaw/extensions/memory-brain/index.ts`):
+- Tool: `dmn_status` — calls `GET /dmn/status`, shows running state + heartbeats + queues + threads
+- HTTP clients: `brainGetDMNThoughts()`, `brainNotifyActivity()`, `brainGetDMNStatus()`
+- Hook update: `before_agent_start` calls `brainNotifyActivity()` (fire-and-forget) to reset DMN idle timer on user input
+
+## Phase 7: Safety Monitor (implemented)
+
+- `brain/src/safety.py` — Standalone module (no brain module imports), math + logging only:
+  - **Phase A (always on):** HardCeiling (MAX_CENTER=0.95, MAX_GOAL_BUDGET_FRACTION=0.40) + DiminishingReturns (gain / log2(evidence))
+  - **Phase B (consolidation-time, disabled by default):** RateLimiter (MAX_CHANGE_PER_CYCLE=0.10 per memory) + TwoGateGuardrail (evidence quality gate + 50 changes/cycle cap)
+  - **Phase C (mature agent, disabled by default):** EntropyMonitor (ENTROPY_FLOOR=2.0 bits, 20-bin histogram) + CircuitBreaker (MAX_CONSECUTIVE=5 same-evidence reinforcements)
+  - **SafetyMonitor** coordinator: `check_weight_change()` -> (allowed, adj_delta_alpha, adj_delta_beta, reasons). Synchronous (no async). `enable_phase_b()`, `enable_phase_c()`, `end_consolidation_cycle(cycle_id)`
+  - **OutcomeTracker**: records gate_decision/promotion/demotion events, forward-linkable via `link_outcome()`, max 2000 records
+  - Module-level `_audit_log` (list[dict], max 1000), `log_safety_event()`, `get_audit_log()`
+- Wired in `api.py` lifespan: `SafetyMonitor()` -> `_memory_store.safety`
+- Wired in `consolidation.py`: `_deep_cycle()` calls `safety.enable_phase_b()` at start, `safety.end_consolidation_cycle(cycle_id)` at end (in finally block)
+- `memory.py:422-431`: existing call site uses `self.safety.check_weight_change()` for retrieval mutation -- now active
+
+**API** (2 new endpoints, version 0.6.0):
+- `GET /safety/status` -> SafetyStatusResponse: { phase_a, phase_b, phase_c, audit_log_size }
+- `GET /safety/audit?limit=50` -> SafetyAuditResponse: { events: [...], count }
+
+**Cross-module dependency graph** (Phase 1+2+3+4+5+6+7):
+```
+config.py            <- standalone
+stochastic.py        <- standalone
+activation.py        <- numpy
+relevance.py         <- activation
+safety.py            <- standalone (math, logging, uuid only)
+memory.py            <- config, relevance, db (pool); safety wired at runtime
+gate.py              <- activation, memory
+gut.py               <- activation (cosine_similarity), numpy, json, pathlib
+context_assembly.py  <- stochastic, activation (cosine_similarity)
+llm.py               <- config (RetryConfig), anthropic
+consolidation.py     <- llm, memory, activation, numpy, asyncpg; safety via memory.store.safety
+rumination.py        <- json, pathlib (standalone)
+dmn_store.py         <- asyncio (standalone)
+idle.py              <- rumination, dmn_store, llm, memory, relevance (spread_activation), asyncpg
+api.py               <- memory, gate, context_assembly, gut, consolidation, idle, dmn_store, safety, db, numpy
+```
+
+## Phase 8: Bootstrap Readiness (implemented)
+
+- `brain/src/bootstrap.py` — Stateless milestone checker (no background task, no persistence):
+  - `BOOTSTRAP_PROMPT` — injected via context assembly for agents that haven't achieved all milestones
+  - `Milestone` dataclass: name, description, achieved (bool), achieved_at
+  - `BootstrapReadiness(pool)` — takes asyncpg pool, no other dependencies
+  - `check_all(agent_id)` — runs 10 DB-direct checks, returns dict with milestones, achieved count, ready flag, bootstrap_prompt, status_text
+  - `render_status()` — "Bootstrap Readiness: X/10" with checkmarks
+  - 10 milestones (all `pool.fetchval()` COUNT queries):
+    1. First Memory — `memories WHERE agent_id` count > 0
+    2. First Retrieval — `access_count > 0`
+    3. First Consolidation — `consolidation_log WHERE agent_id` count > 0
+    4. Goal-Weight Promotion — non-immutable memory with center > 0.6
+    5. First DMN Self-Prompt — `source_tag = 'internal_dmn'`
+    6. Identity-Weight Promotion — non-immutable memory with center > 0.8
+    7. Conflict Resolution — tension type with `metadata->>'resolved' = 'true'`
+    8. Creative Association — `metadata ? 'creative_insight'`
+    9. Goal Reflected — reflection type with content matching goal/achieved
+    10. Autonomous Decision — 3+ identity-weight (center>0.8) AND 2+ reflections
+
+**API** (1 new endpoint, version 0.7.0):
+- `GET /bootstrap/status?agent_id=X` -> BootstrapStatusResponse: { agent_id, milestones, achieved, total, ready, bootstrap_prompt, status_text }
+
+**Cross-module dependency graph** (Phase 1-8):
+```
+config.py            <- standalone
+stochastic.py        <- standalone
+activation.py        <- numpy
+relevance.py         <- activation
+safety.py            <- standalone (math, logging, uuid only)
+memory.py            <- config, relevance, db (pool); safety wired at runtime
+gate.py              <- activation, memory
+gut.py               <- activation (cosine_similarity), numpy, json, pathlib
+context_assembly.py  <- stochastic, activation (cosine_similarity)
+llm.py               <- config (RetryConfig), anthropic
+consolidation.py     <- llm, memory, activation, numpy, asyncpg; safety via memory.store.safety
+rumination.py        <- json, pathlib (standalone)
+dmn_store.py         <- asyncio (standalone)
+idle.py              <- rumination, dmn_store, llm, memory, relevance (spread_activation), asyncpg
+bootstrap.py         <- asyncpg (standalone, DB-direct queries only)
+api.py               <- memory, gate, context_assembly, gut, consolidation, idle, dmn_store, safety, bootstrap, db, numpy
+```
+
 ## Decision Journal
 
 > The Decision Journal tracks **why** decisions changed and what was learned.

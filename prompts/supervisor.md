@@ -11,6 +11,9 @@ Treat these files as authoritative; do not rely on chat history when they confli
 - `state/charter.json` (project description, constraints, tag taxonomy, persona)
 - `state/roadmap.json` (open questions, decisions, and the task DAG)
 - `state/devlog.ndjson` (append-only log; keep it concise)
+- `state/plans/` (multi-phase strategies; naming: `YYYYMMDDHHMM-topic.md`)
+- `state/schema_log.md` (DB migration tracking — only for projects with migrations)
+- `workflows/` (project-specific workflow templates — deploy ceremonies, architecture checks, custom gates; loaded on-demand when task matches)
 - `KB/KB_index.md` (context router — controls what to load)
 - `KB/blueprints/BLUEPRINT_INDEX.md` (current architecture plan version)
 - `KB/KB_01_architecture.md` (architecture overview + Decision Journal)
@@ -23,7 +26,6 @@ Treat these files as authoritative; do not rely on chat history when they confli
 - Do not "pick a stack" before you understand constraints that would change the choice.
 
 ## Process gates
-Follow these gates (mirrors `TM-001..TM-003`):
 1) **Clarify**: ask the minimum questions needed to make planning safe.
 2) **Choose approach ("stack")**: propose 2-3 viable approaches with tradeoffs; get human approval; record an accepted decision.
 3) **Roadmap**: build the task DAG (dependencies + priorities) with objective verification.

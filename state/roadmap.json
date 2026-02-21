@@ -1,8 +1,8 @@
 {
   "meta": {
     "status": "active",
-    "last_updated": "2026-02-19",
-    "session": 8
+    "last_updated": "2026-02-21",
+    "session": 10
   },
   "open_questions": [
     {"id": "Q-001", "question": "GOOGLE_API_KEY .env setup for embedding testing", "blocking": ["T-P1"], "status": "answered"}
@@ -114,7 +114,7 @@
       "intent": "Generate shower thoughts during agent idle time",
       "depends_on": ["T-P3"],
       "priority": "P2",
-      "status": "todo",
+      "status": "done",
       "owner": "ai",
       "deliverable": "brain/src/idle.py, rumination.py, dmn_store.py + GET /dmn/thoughts endpoint",
       "acceptance_criteria": ["4 sampling channels produce diverse thoughts", "Rumination threads form and persist", "OpenClaw plugin polls and surfaces thoughts"],
@@ -126,7 +126,7 @@
       "intent": "Prevent runaway memory weight escalation",
       "depends_on": ["T-P5"],
       "priority": "P3",
-      "status": "todo",
+      "status": "done",
       "owner": "ai",
       "deliverable": "brain/src/safety.py wired into MemoryStore",
       "acceptance_criteria": ["Hard ceiling at 0.95", "Diminishing returns on reinforcement", "Audit log captures events"],
@@ -138,7 +138,7 @@
       "intent": "Track new agent development from blank slate to fully mature",
       "depends_on": ["T-P5", "T-P6"],
       "priority": "P3",
-      "status": "todo",
+      "status": "done",
       "owner": "ai",
       "deliverable": "brain/src/bootstrap.py + GET /bootstrap/status endpoint",
       "acceptance_criteria": ["10 milestones with working checks", "Bootstrap prompt injected for new agents", "Milestones unlock progressively"],

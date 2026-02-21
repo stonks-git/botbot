@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +14,7 @@ BASE_DIR = Path(__file__).resolve().parent
 STATE_DIR = BASE_DIR / "state"
 
 
+# Keep these in sync with CLAUDE.md (Devlog section) and .claude/skills/doc/SKILL.md (Event types).
 ALLOWED_TASK_STATUSES = {"todo", "doing", "done", "blocked", "skipped"}
 ALLOWED_DECISION_STATUSES = {"proposed", "accepted", "rejected", "superseded"}
 ALLOWED_QUESTION_STATUSES = {"open", "answered", "dropped"}
@@ -20,6 +22,8 @@ ALLOWED_DEVLOG_EVENTS = {
     "feature", "bugfix", "refactor", "kb_update", "decision",
     "handoff", "verification", "human_review", "blueprint", "dj_entry",
 }
+TERMINAL_TASK_STATUSES = {"done", "skipped"}
+_ISO8601_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}")
 
 
 def _read_json(path: Path) -> Any:
@@ -73,12 +77,17 @@ def validate_charter(charter: Any) -> list[ValidationIssue]:
     for key in ("project", "working_agreement", "assistant_persona"):
         if key not in charter:
             issues.append(ValidationIssue("error", f"charter: missing key `{key}`"))
+        elif not isinstance(charter[key], dict):
+            issues.append(ValidationIssue("error", f"charter.{key}: expected dict"))
 
     project = charter.get("project")
     if isinstance(project, dict):
         for key in ("name", "one_liner", "type", "why", "success_criteria", "constraints"):
             if key not in project:
                 issues.append(ValidationIssue("error", f"charter.project: missing key `{key}`"))
+        constraints = project.get("constraints")
+        if constraints is not None and not isinstance(constraints, dict):
+            issues.append(ValidationIssue("error", "charter.project.constraints: expected dict"))
 
         if _is_nonempty_str(project.get("one_liner")) is False:
             issues.append(ValidationIssue("warning", "charter.project.one_liner: empty (planning may be ambiguous)"))
@@ -127,6 +136,9 @@ def validate_devlog(devlog_path: Path) -> list[ValidationIssue]:
         for key in ("ts", "event", "summary"):
             if key not in entry:
                 issues.append(ValidationIssue("error", f"devlog line {line_num}: missing `{key}`"))
+        ts = entry.get("ts")
+        if isinstance(ts, str) and not _ISO8601_RE.match(ts):
+            issues.append(ValidationIssue("warning", f"devlog line {line_num}: `ts` is not ISO 8601 format"))
         event = entry.get("event")
         if isinstance(event, str) and event not in ALLOWED_DEVLOG_EVENTS:
             issues.append(ValidationIssue("warning", f"devlog line {line_num}: unknown event `{event}`"))
@@ -327,6 +339,8 @@ def cmd_validate(_: argparse.Namespace) -> int:
         print(_format_issues(issues))
     if errors:
         return 1
+    if not issues:
+        print("Validation passed.")
     return 0
 
 
@@ -352,7 +366,6 @@ def cmd_ready(_: argparse.Namespace) -> int:
         return 1
 
     task_by_id = {t["id"]: t for t in ordered_tasks}
-    done_statuses = {"done", "skipped"}
     ready: list[dict[str, Any]] = []
 
     for task in ordered_tasks:
@@ -361,10 +374,12 @@ def cmd_ready(_: argparse.Namespace) -> int:
         deps = task.get("depends_on", [])
         if not isinstance(deps, list):
             continue
-        if all(task_by_id[dep].get("status") in done_statuses for dep in deps):
+        if all(task_by_id[dep].get("status") in TERMINAL_TASK_STATUSES for dep in deps):
             ready.append(task)
 
     ready.sort(key=lambda t: (_priority_key(t.get("priority")), t["id"]))
+    if not ready:
+        print("No tasks ready.")
     for task in ready:
         print(f'{task["id"]}\t{task.get("priority")}\t{task.get("title")}')
     return 0
@@ -433,7 +448,7 @@ def build_parser() -> argparse.ArgumentParser:
     ready.set_defaults(func=cmd_ready)
 
     steps = sub.add_parser("steps", help="Show decomposition steps for a task.")
-    steps.add_argument("task_id", help="Task ID to show steps for (e.g., TASK-001)")
+    steps.add_argument("task_id", help="Task ID to show steps for (e.g., T-001)")
     steps.set_defaults(func=cmd_steps)
 
     return parser

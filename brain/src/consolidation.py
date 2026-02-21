@@ -391,21 +391,31 @@ class DeepConsolidation:
         logger.info("Deep consolidation starting for %s", agent_id)
         results: dict = {}
 
-        results["merge_insight"] = await self._safe_step(
-            self._merge_and_insight, agent_id
-        )
-        results["promote"] = await self._safe_step(
-            self._promote_patterns, agent_id
-        )
-        results["decay_reconsolidate"] = await self._safe_step(
-            self._decay_and_reconsolidate, agent_id
-        )
-        results["tune"] = await self._safe_step(
-            self._tune_parameters, agent_id
-        )
-        results["contextual"] = await self._safe_step(
-            self._contextual_retrieval, agent_id
-        )
+        # Enable Phase B safety for consolidation cycle
+        cycle_id = f"deep_{agent_id}_{int(time.time())}"
+        safety = self.store.safety
+        if safety:
+            safety.enable_phase_b()
+
+        try:
+            results["merge_insight"] = await self._safe_step(
+                self._merge_and_insight, agent_id
+            )
+            results["promote"] = await self._safe_step(
+                self._promote_patterns, agent_id
+            )
+            results["decay_reconsolidate"] = await self._safe_step(
+                self._decay_and_reconsolidate, agent_id
+            )
+            results["tune"] = await self._safe_step(
+                self._tune_parameters, agent_id
+            )
+            results["contextual"] = await self._safe_step(
+                self._contextual_retrieval, agent_id
+            )
+        finally:
+            if safety:
+                safety.end_consolidation_cycle(cycle_id)
 
         await _log_consolidation(self.pool, agent_id, "deep_cycle", results)
         logger.info("Deep consolidation complete for %s", agent_id)

@@ -11,7 +11,7 @@
 | 02 | `KB/KB_02_intuitive_ai_reference.md` | Source reference: all 13 intuitive-AI modules | brain, memory, arch | on-demand: when implementing any brain module |
 
 <!--
-LOADING RULES (for Opus 4.6):
+LOADING RULES (for the supervisor agent):
 
 1. Bootstrap: load all "always" files. For "always (latest only)", check BLUEPRINT_INDEX.md for current version pointer.
 2. During work: if current task touches a tag domain, grep DJ headers for matching [tag] and load those entries.
