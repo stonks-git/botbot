@@ -78,7 +78,7 @@ BotBot bolts the intuitive-AI cognitive architecture (memory with Beta-distribut
 
 | Task ID | Status |
 |---------|--------|
-| Integration testing | DONE — all 19/19 endpoints pass |
+| OpenClaw agent setup | NEXT — wire OpenClaw runtime + memory-brain plugin |
 
 ## Blockers or open questions
 
@@ -93,8 +93,8 @@ BotBot bolts the intuitive-AI cognitive architecture (memory with Beta-distribut
 ## Git Status
 
 - **Branch:** main
-- **Last commit:** 930fc54 Inline openclaw: convert submodule to regular files for portable deployment
-- **Modified (tracked):** brain/src/llm.py, brain/requirements.txt, brain/Dockerfile, docker-compose.yml
+- **Last commit:** cab2a7c Integration testing + LLM switch to Gemini 3 Flash Preview
+- **Modified (tracked):** none (clean)
 - **New (untracked):** .env, brain-state/
 
 ---
@@ -102,7 +102,7 @@ BotBot bolts the intuitive-AI cognitive architecture (memory with Beta-distribut
 ## Memory Marker
 
 ```
-MEMORY_MARKER: 2026-02-21T22:40:00+02:00 | Integration test DONE | 19/19 endpoints pass, LLM switched to Gemini Flash (D-006), Dockerfile /app/state perms fixed | Next: commit, plugin bootstrap wiring, deploy
+MEMORY_MARKER: 2026-02-21T23:00:00+02:00 | Session 12 DONE | Brain 19/19 endpoints pass, LLM=gemini-3-flash-preview, repo self-contained | Next: OpenClaw agent runtime setup + memory-brain plugin wiring
 ```
 
 ---
@@ -110,9 +110,35 @@ MEMORY_MARKER: 2026-02-21T22:40:00+02:00 | Integration test DONE | 19/19 endpoin
 ## Next Session Bootstrap
 
 1. Read `KB/blueprints/v0.3_current_state.md` — **the single source of truth** for project state
-2. All brain phases (0-8) complete + integration tested — 19 endpoints, all passing
-3. LLM is Gemini 3 Flash Preview (not Anthropic) — see D-006
-4. Next steps: commit integration changes, plugin bootstrap prompt wiring, deploy to production
+2. All brain phases (0-8) complete + integration tested — 19/19 endpoints pass
+3. LLM is `gemini-3-flash-preview` (D-006), single `GOOGLE_API_KEY` for embed + LLM
+4. Repo is self-contained (openclaw inlined, no submodule)
+5. `docker compose up -d` starts postgres + brain on `:8400`
+
+### Next phase: OpenClaw Agent Runtime
+
+**Goal:** Get an actual agent running that uses the brain.
+
+**What exists:**
+- `openclaw/` — full OpenClaw source inlined in repo
+- `openclaw/extensions/memory-brain/index.ts` — plugin with all brain HTTP clients, tools, and hooks already coded
+- Plugin has: `before_agent_start` (context assembly + attention + DMN activity), `agent_end` (auto-capture via gate), 8 tools (memory_recall, memory_store, memory_forget, introspect, gut_check, consolidation_status, consolidation_trigger, dmn_status)
+
+**What needs to happen:**
+1. **Understand OpenClaw's setup** — how to configure and run an agent (likely `docker-compose` or direct Node.js)
+2. **Add OpenClaw service to docker-compose.yml** — third container alongside postgres + brain
+3. **Register the memory-brain plugin** — OpenClaw needs to know about the extension
+4. **Configure the agent** — which LLM it uses for conversations (separate from brain's Gemini Flash), system prompt, personality
+5. **Wire bootstrap prompt injection** — newborn agents get BOOTSTRAP_PROMPT from `/bootstrap/status`
+6. **Test end-to-end** — send a message to the agent, verify memories are stored, identity forms, gut responds
+7. **Create `.env.example`** — document required env vars for new users
+8. **Add `.env` and `brain-state/` to `.gitignore`**
+
+**Key files to explore:**
+- `openclaw/docker-compose.yml` — OpenClaw's own compose (may need merging)
+- `openclaw/Dockerfile` — how OpenClaw builds
+- `openclaw/extensions/` — how extensions are registered
+- `openclaw/CLAUDE.md` or `openclaw/docs/` — setup documentation
 
 ---
 
