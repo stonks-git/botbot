@@ -106,6 +106,7 @@ If you don't remember current task/recent files/decisions: **STOP.** Follow Boot
 - Audit orchestrator: `prompts/auditors/runner.md` — manual use prompt for running full audit sequences. Not a subagent (can't call sub-subagents).
 - Supervisor contract: `prompts/supervisor.md`
 - Project workflows: `workflows/` — on-demand project-specific workflow templates (deploy ceremonies, architecture checks, custom gates). Loaded when task matches.
+- **Deploy target:** norisor (100.66.170.31 via Tailscale). See `workflows/deploy.md` for full procedure. Quick: `git push && ssh norisor "cd ~/botbot && git pull && docker compose build brain openclaw && docker compose up -d"`.
 - Operational plans: `state/plans/` — multi-phase execution scripts with tracked progress. Naming: `YYYYMMDDHHMM-topic.md`. See `state/plans/README.md` for template and workflow.
 - All agents inherit this CLAUDE.md automatically.
 - Agent stub paths are relative to repository root.
