@@ -13,6 +13,8 @@ from datetime import datetime, timezone
 
 import asyncpg
 
+from .config import WEIGHT_CENTER_SQL
+
 logger = logging.getLogger("brain.bootstrap")
 
 BOOTSTRAP_PROMPT = (
@@ -115,11 +117,11 @@ class BootstrapReadiness:
 
     async def _check_goal_weight_promotion(self, agent_id: str) -> bool:
         count = await self.pool.fetchval(
-            """
+            f"""
             SELECT COUNT(*) FROM memories
             WHERE agent_id = $1
               AND NOT immutable
-              AND depth_weight_alpha / (depth_weight_alpha + depth_weight_beta) > 0.6
+              AND {WEIGHT_CENTER_SQL} > 0.6
             """,
             agent_id,
         )
@@ -134,11 +136,11 @@ class BootstrapReadiness:
 
     async def _check_identity_weight_promotion(self, agent_id: str) -> bool:
         count = await self.pool.fetchval(
-            """
+            f"""
             SELECT COUNT(*) FROM memories
             WHERE agent_id = $1
               AND NOT immutable
-              AND depth_weight_alpha / (depth_weight_alpha + depth_weight_beta) > 0.8
+              AND {WEIGHT_CENTER_SQL} > 0.8
             """,
             agent_id,
         )
@@ -172,11 +174,11 @@ class BootstrapReadiness:
 
     async def _check_autonomous_decision(self, agent_id: str) -> bool:
         identity_count = await self.pool.fetchval(
-            """
+            f"""
             SELECT COUNT(*) FROM memories
             WHERE agent_id = $1
               AND NOT immutable
-              AND depth_weight_alpha / (depth_weight_alpha + depth_weight_beta) > 0.8
+              AND {WEIGHT_CENTER_SQL} > 0.8
             """,
             agent_id,
         )

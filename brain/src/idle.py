@@ -14,6 +14,8 @@ from typing import Callable
 
 import asyncpg
 
+from .config import WEIGHT_CENTER_SQL
+from .db import get_agent_ids
 from .dmn_store import AttentionCandidate, DMN_URGENCY, ThoughtQueue
 from .llm import retry_llm_call
 from .memory import MemoryStore
@@ -44,15 +46,6 @@ INTERVAL_IDLE_4HOURS = 1800   # 4+ hours idle
 LOOP_SLEEP = 30
 
 
-# ── Helpers ──────────────────────────────────────────────────────────────
-
-
-async def _get_agent_ids(pool: asyncpg.Pool) -> list[str]:
-    """Get all distinct agent IDs that have memories."""
-    rows = await pool.fetch("SELECT DISTINCT agent_id FROM memories")
-    return [r["agent_id"] for r in rows]
-
-
 # ── IdleLoop ─────────────────────────────────────────────────────────────
 
 
@@ -65,11 +58,13 @@ class IdleLoop:
         memory_store: MemoryStore,
         thought_queue: ThoughtQueue,
         gut_getter: Callable,
+        notification_store=None,
     ):
         self.pool = pool
         self.memory_store = memory_store
         self.thought_queue = thought_queue
         self._gut_getter = gut_getter  # Callable[[str], GutFeeling] — injected to avoid circular import
+        self.notification_store = notification_store
 
         self._rumination: dict[str, RuminationManager] = {}
         self._recent_topics: dict[str, collections.deque] = {}
@@ -87,7 +82,7 @@ class IdleLoop:
 
         while not shutdown_event.is_set():
             try:
-                agent_ids = await _get_agent_ids(self.pool)
+                agent_ids = await get_agent_ids(self.pool)
 
                 for agent_id in agent_ids:
                     interval = self._agent_interval(agent_id)
@@ -211,9 +206,9 @@ class IdleLoop:
     async def _sample_fallback(self, agent_id: str) -> dict | None:
         """Pick from all memories with probability proportional to weight center."""
         rows = await self.pool.fetch(
-            """
+            f"""
             SELECT id, content, type,
-                   depth_weight_alpha / (depth_weight_alpha + depth_weight_beta) AS center
+                   {WEIGHT_CENTER_SQL} AS center
             FROM memories
             WHERE agent_id = $1
               AND embedding IS NOT NULL
@@ -249,11 +244,11 @@ class IdleLoop:
     async def _sample_neglected(self, agent_id: str) -> dict | None:
         """High-weight memories not accessed in 7+ days."""
         row = await self.pool.fetchrow(
-            """
+            f"""
             SELECT id, content, type
             FROM memories
             WHERE agent_id = $1
-              AND depth_weight_alpha / (depth_weight_alpha + depth_weight_beta) > 0.5
+              AND {WEIGHT_CENTER_SQL} > 0.5
               AND (last_accessed IS NULL OR last_accessed < NOW() - INTERVAL '7 days')
             ORDER BY RANDOM() LIMIT 1
             """,
@@ -267,11 +262,11 @@ class IdleLoop:
     async def _sample_tension(self, agent_id: str) -> dict | None:
         """High-weight seed + moderately similar partner of different type."""
         seed = await self.pool.fetchrow(
-            """
-            SELECT id, content, type, embedding::float4[] AS emb_arr
+            f"""
+            SELECT id, content, type, embedding
             FROM memories
             WHERE agent_id = $1
-              AND depth_weight_alpha / (depth_weight_alpha + depth_weight_beta) > 0.5
+              AND {WEIGHT_CENTER_SQL} > 0.5
               AND embedding IS NOT NULL
             ORDER BY RANDOM() LIMIT 1
             """,
@@ -280,9 +275,6 @@ class IdleLoop:
         if not seed:
             return None
 
-        # Format embedding for halfvec cast
-        emb_str = "[" + ",".join(str(x) for x in seed["emb_arr"]) + "]"
-
         partner = await self.pool.fetchrow(
             """
             SELECT id, content, type
@@ -290,12 +282,12 @@ class IdleLoop:
             WHERE agent_id = $1
               AND type != $2
               AND embedding IS NOT NULL
-              AND 1 - (embedding <=> $3::halfvec) BETWEEN 0.3 AND 0.7
+              AND 1 - (embedding <=> $3) BETWEEN 0.3 AND 0.7
             ORDER BY RANDOM() LIMIT 1
             """,
             agent_id,
             seed["type"],
-            emb_str,
+            seed["embedding"],
         )
 
         if partner:
@@ -314,7 +306,7 @@ class IdleLoop:
 
         # No partner found — return seed alone
         logger.debug("Tension channel: seed only %s for %s", seed["id"], agent_id)
-        return dict(seed)
+        return {"id": seed["id"], "content": seed["content"], "type": seed["type"]}
 
     async def _sample_temporal(self, agent_id: str) -> dict | None:
         """Old memories (30+ days) for creative reconnection."""
@@ -336,12 +328,12 @@ class IdleLoop:
     async def _sample_introspective(self, agent_id: str) -> dict | None:
         """High-weight reflective memories (reflection, narrative, preference, tension)."""
         row = await self.pool.fetchrow(
-            """
+            f"""
             SELECT id, content, type
             FROM memories
             WHERE agent_id = $1
               AND type IN ('reflection', 'narrative', 'preference', 'tension')
-              AND depth_weight_alpha / (depth_weight_alpha + depth_weight_beta) > 0.6
+              AND {WEIGHT_CENTER_SQL} > 0.6
             ORDER BY RANDOM() LIMIT 1
             """,
             agent_id,
@@ -363,12 +355,12 @@ class IdleLoop:
         """Classify a sampled memory into a DMN output channel."""
         # 1. Goal connection: check keyword overlap with high-weight goal-like memories
         goal_rows = await self.pool.fetch(
-            """
+            f"""
             SELECT content FROM memories
             WHERE agent_id = $1
               AND type IN ('narrative', 'reflection')
-              AND depth_weight_alpha / (depth_weight_alpha + depth_weight_beta) > 0.6
-            ORDER BY depth_weight_alpha / (depth_weight_alpha + depth_weight_beta) DESC
+              AND {WEIGHT_CENTER_SQL} > 0.6
+            ORDER BY {WEIGHT_CENTER_SQL} DESC
             LIMIT 5
             """,
             agent_id,
@@ -487,6 +479,20 @@ class IdleLoop:
             )
         except Exception as e:
             logger.warning("Failed to persist DMN thought: %s", e)
+
+        # D-019: Notify for goal/identity channel thoughts
+        if channel in ("DMN/goal", "DMN/identity") and self.notification_store:
+            try:
+                await self.notification_store.enqueue(
+                    agent_id=agent_id,
+                    content=thought[:300],
+                    urgency=0.1,
+                    importance=0.6,
+                    source=f"dmn/{channel}",
+                    source_memory_id=memory_id,
+                )
+            except Exception:
+                pass
 
         # Track for repetition detection
         if agent_id not in self._recent_topics:

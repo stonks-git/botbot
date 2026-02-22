@@ -43,6 +43,12 @@ async def _run_schema(pool: asyncpg.Pool) -> None:
     logger.info("Schema migration applied.")
 
 
+async def get_agent_ids(pool: asyncpg.Pool) -> list[str]:
+    """Get all distinct agent IDs that have memories."""
+    rows = await pool.fetch("SELECT DISTINCT agent_id FROM memories")
+    return [r["agent_id"] for r in rows]
+
+
 async def close_pool() -> None:
     """Close the connection pool."""
     global _pool

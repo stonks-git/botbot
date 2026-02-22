@@ -84,3 +84,64 @@ async def retry_llm_call(
             )
             await asyncio.sleep(delay)
     raise RuntimeError(f"LLM call failed after {cfg.max_retries} attempts: {last_err}")
+
+
+async def llm_call_with_search(
+    prompt: str,
+    temperature: float = 1.0,
+    model: str = DEFAULT_MODEL,
+) -> tuple[str, list[dict], int]:
+    """LLM call with Google Search grounding (D-016).
+
+    Returns (response_text, grounding_sources, grounding_chunk_count).
+    Temperature 1.0 recommended for Gemini 3 with tools.
+    """
+    client = _get_client()
+    search_tool = genai.types.Tool(google_search=genai.types.GoogleSearch())
+    response = await asyncio.to_thread(
+        client.models.generate_content,
+        model=model,
+        contents=prompt,
+        config=genai.types.GenerateContentConfig(
+            temperature=temperature,
+            tools=[search_tool],
+        ),
+    )
+    sources: list[dict] = []
+    grounding_chunk_count = 0
+    for candidate in (response.candidates or []):
+        gm = getattr(candidate, "grounding_metadata", None)
+        if gm:
+            chunks = getattr(gm, "grounding_chunks", None) or []
+            grounding_chunk_count = len(chunks)
+            for chunk in chunks:
+                web = getattr(chunk, "web", None)
+                if web:
+                    sources.append({
+                        "uri": getattr(web, "uri", ""),
+                        "title": getattr(web, "title", ""),
+                    })
+    return response.text.strip(), sources, grounding_chunk_count
+
+
+async def retry_llm_call_with_search(
+    prompt: str,
+    temperature: float = 1.0,
+    model: str = DEFAULT_MODEL,
+    retry_config: RetryConfig | None = None,
+) -> tuple[str, list[dict], int]:
+    """LLM call with Google Search grounding + retry."""
+    cfg = retry_config or RetryConfig()
+    last_err = None
+    for attempt in range(cfg.max_retries):
+        try:
+            return await llm_call_with_search(prompt, temperature, model)
+        except Exception as e:
+            last_err = e
+            delay = min(cfg.base_delay * (2**attempt), cfg.max_delay)
+            logger.warning(
+                "Search LLM attempt %d failed: %s (retry in %.1fs)",
+                attempt + 1, e, delay,
+            )
+            await asyncio.sleep(delay)
+    raise RuntimeError(f"Search LLM call failed after {cfg.max_retries} attempts: {last_err}")

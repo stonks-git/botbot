@@ -7,11 +7,70 @@ Exit gate: 3x3 decision matrix (relevance × novelty) → persist/reinforce/buff
 import logging
 import math
 import random
+import re
 from dataclasses import dataclass, field
 
 from .activation import spreading_activation
+from .config import NOVELTY_THRESHOLD
 
 logger = logging.getLogger("brain.gate")
+
+
+# ── Semantic chunking (D-018b) ────────────────────────────────────────
+
+MAX_CHUNK_TOKENS = 300
+
+
+def _estimate_tokens(text: str) -> int:
+    """Rough token estimate: ~4 chars per token."""
+    return max(1, len(text) // 4)
+
+
+def semantic_chunk(text: str, max_tokens: int = MAX_CHUNK_TOKENS) -> list[str]:
+    """Split text into semantically coherent chunks, each ≤ max_tokens.
+
+    Algorithm: split by paragraph (\\n\\n), then sentence boundaries.
+    Greedily merge segments into chunks under the token limit.
+    Single sentences exceeding max_tokens are kept whole (no mid-sentence split).
+    """
+    if _estimate_tokens(text) <= max_tokens:
+        return [text]
+
+    # Split into paragraphs first
+    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
+
+    # Break paragraphs into sentences
+    segments: list[str] = []
+    for para in paragraphs:
+        # Split on sentence boundaries (. ! ?) followed by space or end
+        sentences = re.split(r'(?<=[.!?])\s+', para)
+        sentences = [s.strip() for s in sentences if s.strip()]
+        if sentences:
+            segments.extend(sentences)
+        else:
+            segments.append(para)
+
+    # Greedily merge segments into chunks
+    chunks: list[str] = []
+    current: list[str] = []
+    current_tokens = 0
+
+    for seg in segments:
+        seg_tokens = _estimate_tokens(seg)
+        # +1 for the space when joining with existing segments
+        added_tokens = seg_tokens + (1 if current else 0)
+        if current and current_tokens + added_tokens > max_tokens:
+            chunks.append(" ".join(current))
+            current = [seg]
+            current_tokens = seg_tokens
+        else:
+            current.append(seg)
+            current_tokens += added_tokens
+
+    if current:
+        chunks.append(" ".join(current))
+
+    return chunks if chunks else [text]
 
 # ── Decision constants ────────────────────────────────────────────────
 
@@ -117,7 +176,7 @@ def detect_contradiction_negation(new_content: str, existing_content: str) -> fl
 class ExitGateConfig:
     core_threshold: float = 0.6
     peripheral_threshold: float = 0.3
-    confirming_sim: float = 0.85
+    confirming_sim: float = NOVELTY_THRESHOLD
     novel_sim: float = 0.6
     contradiction_sim: float = 0.7
     drop_noise_floor: float = 0.02
@@ -131,7 +190,7 @@ class ExitGateConfig:
 _DECISION_MATRIX: dict[tuple[str, str], tuple[str, float]] = {
     # Core relevance
     ("core", "confirming"):    (REINFORCE, 0.50),
-    ("core", "novel"):         (PERSIST, 0.85),
+    ("core", "novel"):         (PERSIST, NOVELTY_THRESHOLD),
     ("core", "contradicting"): (PERSIST_FLAG, 0.95),
     # Peripheral relevance
     ("peripheral", "confirming"):    (SKIP, 0.15),

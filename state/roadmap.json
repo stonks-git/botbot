@@ -5,7 +5,14 @@
     "session": 21
   },
   "open_questions": [
-    {"id": "Q-001", "question": "GOOGLE_API_KEY .env setup for embedding testing", "blocking": ["T-P1"], "status": "answered"}
+    {
+      "id": "Q-001",
+      "question": "GOOGLE_API_KEY .env setup for embedding testing",
+      "blocking": [
+        "T-P1"
+      ],
+      "status": "answered"
+    }
   ],
   "decisions": [
     {
@@ -50,17 +57,17 @@
     },
     {
       "id": "D-015",
-      "summary": "Identity injection: injection_score = weight_center * cosine_sim. No floor. All non-immutable memories vector-scored. Zero relevance = zero score. Log all w×s interactions. See DJ-005.",
+      "summary": "Identity injection: injection_score = weight_center * cosine_sim. No floor. All non-immutable memories vector-scored. Zero relevance = zero score. Log all w\u00d7s interactions. See DJ-005.",
       "status": "accepted"
     },
     {
       "id": "D-016",
-      "summary": "Consolidation research: contradiction → LLM classifies (factual/subjective, confidence>0.7) → spawn agent research session with web search. 1/hour, 24/day max. Highest single weight priority. Skip both<0.3. HIGH confidence to displace. See DJ-007.",
-      "status": "accepted"
+      "summary": "Consolidation research: contradiction \u2192 LLM classifies \u2192 Google Search grounding (2-search confirmation, DJ-008). 1/hour, 24/day max. Skip both<0.3. Skip external_user. Displace only when 2 independent searches agree.",
+      "status": "superseded"
     },
     {
       "id": "D-017",
-      "summary": "No core identity tier. Identity hash dormant (feature-flagged off). System prompt = immutables + w×s scored memories. Core values emerge from behavioral patterns via consolidation insights. See DJ-006.",
+      "summary": "No core identity tier. Identity hash dormant (feature-flagged off). System prompt = immutables + w\u00d7s scored memories. Core values emerge from behavioral patterns via consolidation insights. See DJ-006.",
       "status": "accepted"
     },
     {
@@ -80,12 +87,12 @@
     },
     {
       "id": "D-018d",
-      "summary": "w×s interaction logging: injection_logs DB table + 3-tier analysis (real-time metrics, daily batch+behavioral classification, weekly anomaly detection). Full context logged for formula evaluation.",
+      "summary": "w\u00d7s interaction logging: injection_logs DB table + 3-tier analysis (real-time metrics, daily batch+behavioral classification, weekly anomaly detection). Full context logged for formula evaluation.",
       "status": "accepted"
     },
     {
       "id": "D-019",
-      "summary": "Proactive notifications: urgency (time-sensitive, push NOW) ≠ importance (content significance, btw next chat) ≠ weight. notification_outbox + delivery worker + Telegram/WhatsApp/webhook channels. Quiet hours.",
+      "summary": "Proactive notifications: urgency (time-sensitive, push NOW) \u2260 importance (content significance, btw next chat) \u2260 weight. notification_outbox + delivery worker + Telegram/WhatsApp/webhook channels. Quiet hours.",
       "status": "accepted"
     },
     {
@@ -95,17 +102,17 @@
     },
     {
       "id": "D-021",
-      "summary": "Pattern detection: 1/day, HDBSCAN cluster embeddings, per-cluster LLM analysis, cross-cluster summary. 1-level recursion (insights→meta-insights, meta excluded from future). No cap. Dedup sim>0.85. Insight weights = weighted average by center of sources.",
+      "summary": "Pattern detection: 1/day, HDBSCAN cluster embeddings, per-cluster LLM analysis, cross-cluster summary. 1-level recursion (insights\u2192meta-insights, meta excluded from future). No cap. Dedup sim>0.85. Insight weights = weighted average by center of sources.",
       "status": "accepted"
     },
     {
       "id": "D-022",
-      "summary": "Decay tick interval 5min→1h. 12x reduction in idle decay pressure. Prevents death spiral without conversation.",
+      "summary": "Decay tick interval 5min\u21921h. 12x reduction in idle decay pressure. Prevents death spiral without conversation.",
       "status": "accepted"
     },
     {
       "id": "D-023",
-      "summary": "Consolidation dedup+reinforce. All 4 creation paths check novelty at sim>=0.85. Not novel → reinforce existing via apply_retrieval_mutation. Prevents duplicate memory flood.",
+      "summary": "Consolidation dedup+reinforce. All 4 creation paths check novelty at sim>=0.85. Not novel \u2192 reinforce existing via apply_retrieval_mutation. Prevents duplicate memory flood.",
       "status": "accepted"
     },
     {
@@ -115,7 +122,7 @@
     },
     {
       "id": "D-025",
-      "summary": "Insight weight inheritance. store_insight computes weighted-avg alpha/beta from sources (center-weighted). No source importance demotion — sources keep weight until insight proves itself.",
+      "summary": "Insight weight inheritance. store_insight computes weighted-avg alpha/beta from sources (center-weighted). No source importance demotion \u2014 sources keep weight until insight proves itself.",
       "status": "accepted"
     }
   ],
@@ -129,141 +136,250 @@
       "status": "done",
       "owner": "ai",
       "deliverable": "brain/ directory with Dockerfile, schema.sql, db.py, api.py + docker-compose.yml",
-      "acceptance_criteria": ["Dockerfile builds", "schema.sql is idempotent", "/health endpoint responds 200"],
-      "verification": ["docker compose up postgres brain", "curl localhost:8400/health"]
+      "acceptance_criteria": [
+        "Dockerfile builds",
+        "schema.sql is idempotent",
+        "/health endpoint responds 200"
+      ],
+      "verification": [
+        "docker compose up postgres brain",
+        "curl localhost:8400/health"
+      ]
     },
     {
       "id": "T-P1",
       "title": "Memory Core: store + retrieve + embed + OpenClaw plugin",
       "intent": "MVP proving end-to-end integration: store memories via brain API, retrieve them in OpenClaw context",
-      "depends_on": ["T-P0"],
+      "depends_on": [
+        "T-P0"
+      ],
       "priority": "P0",
       "status": "done",
       "owner": "ai",
       "deliverable": "brain/src/memory.py, relevance.py, stochastic.py, activation.py + openclaw/extensions/memory-brain/",
-      "acceptance_criteria": ["Store a memory via POST /memory/store", "Retrieve via POST /memory/retrieve", "OpenClaw plugin injects memories into LLM context"],
-      "verification": ["curl POST /memory/store with test content", "curl POST /memory/retrieve with query", "Send message to OpenClaw, verify memory appears in context"]
+      "acceptance_criteria": [
+        "Store a memory via POST /memory/store",
+        "Retrieve via POST /memory/retrieve",
+        "OpenClaw plugin injects memories into LLM context"
+      ],
+      "verification": [
+        "curl POST /memory/store with test content",
+        "curl POST /memory/retrieve with query",
+        "Send message to OpenClaw, verify memory appears in context"
+      ]
     },
     {
       "id": "T-P2",
       "title": "Entry/Exit Gate: ACT-R gate system + scratch buffer",
       "intent": "Replace naive auto-capture with intelligent filtering",
-      "depends_on": ["T-P1"],
+      "depends_on": [
+        "T-P1"
+      ],
       "priority": "P1",
       "status": "done",
       "owner": "ai",
       "deliverable": "brain/src/gate.py + POST /memory/gate endpoint",
-      "acceptance_criteria": ["Entry gate stochastically filters content", "Exit gate applies 3x3 decision matrix", "Scratch buffer has 24h TTL"],
-      "verification": ["Send various content types, verify gate decisions", "Check scratch buffer expiry"]
+      "acceptance_criteria": [
+        "Entry gate stochastically filters content",
+        "Exit gate applies 3x3 decision matrix",
+        "Scratch buffer has 24h TTL"
+      ],
+      "verification": [
+        "Send various content types, verify gate decisions",
+        "Check scratch buffer expiry"
+      ]
     },
     {
       "id": "T-P3",
       "title": "Context Assembly + Unified Identity",
       "intent": "Give agents persistent identity (from unified memory weights) and structured context injection",
-      "depends_on": ["T-P1"],
+      "depends_on": [
+        "T-P1"
+      ],
       "priority": "P1",
       "status": "done",
       "owner": "ai",
       "deliverable": "brain/src/context_assembly.py + POST /context/assemble, GET /identity endpoints. NO layers.py (D-005: unified memory)",
-      "acceptance_criteria": ["Context assembly returns identity (from top DB memories by weight) + situational memories", "Stochastic injection varies between calls", "GATE WIRING: POST /memory/gate passes top-N memory embeddings to ExitGate.evaluate()", "No L0/L1 JSON files — identity is the weights", "GET /identity renders from top memories, not JSON files"],
-      "verification": ["Store memories, call /context/assemble — identity section populated from DB", "Verify /memory/gate exit gate classifies relevance from top-N memory embeddings", "No references to LayerStore or layers.py in codebase"],
+      "acceptance_criteria": [
+        "Context assembly returns identity (from top DB memories by weight) + situational memories",
+        "Stochastic injection varies between calls",
+        "GATE WIRING: POST /memory/gate passes top-N memory embeddings to ExitGate.evaluate()",
+        "No L0/L1 JSON files \u2014 identity is the weights",
+        "GET /identity renders from top memories, not JSON files"
+      ],
+      "verification": [
+        "Store memories, call /context/assemble \u2014 identity section populated from DB",
+        "Verify /memory/gate exit gate classifies relevance from top-N memory embeddings",
+        "No references to LayerStore or layers.py in codebase"
+      ],
       "rework_plan": "KB/blueprints/v0.2_unified_memory_rework.md"
     },
     {
       "id": "T-P4",
       "title": "Gut Feeling: two-centroid emotional model",
       "intent": "Give agents an emotional compass based on experience divergence",
-      "depends_on": ["T-P3"],
+      "depends_on": [
+        "T-P3"
+      ],
       "priority": "P2",
       "status": "done",
       "owner": "ai",
       "deliverable": "brain/src/gut.py + POST /context/attention, GET /gut/{agent_id} endpoints",
-      "acceptance_criteria": ["Two centroids compute correctly", "Emotional charge rises on divergence", "Gut summary appears in assembled context", "GATE WIRING: POST /memory/gate passes attention_embedding and emotional_charge to ExitGate.evaluate()"],
-      "verification": ["Send messages on different topics, verify centroid shift", "Check gut_state endpoint", "Verify /memory/gate exit gate uses emotional_charge_bonus when charge >= 0.3"]
+      "acceptance_criteria": [
+        "Two centroids compute correctly",
+        "Emotional charge rises on divergence",
+        "Gut summary appears in assembled context",
+        "GATE WIRING: POST /memory/gate passes attention_embedding and emotional_charge to ExitGate.evaluate()"
+      ],
+      "verification": [
+        "Send messages on different topics, verify centroid shift",
+        "Check gut_state endpoint",
+        "Verify /memory/gate exit gate uses emotional_charge_bonus when charge >= 0.3"
+      ]
     },
     {
       "id": "T-P5",
       "title": "Consolidation Engine: Tier 1 + Tier 2 background processing",
       "intent": "Background memory processing: decay, contradiction scan, pattern detection, insight generation",
-      "depends_on": ["T-P3"],
+      "depends_on": [
+        "T-P3"
+      ],
       "priority": "P2",
       "status": "done",
       "owner": "ai",
       "deliverable": "brain/src/llm.py, brain/src/consolidation.py + GET /consolidation/status, POST /consolidation/trigger endpoints",
-      "acceptance_criteria": ["Tier 1 runs on schedule (5/10/15 min)", "Tier 2 runs hourly or on trigger", "Insights created with memory_supersedes links"],
-      "verification": ["Store 50+ memories, wait for Tier 1", "Trigger deep consolidation, verify insights"]
+      "acceptance_criteria": [
+        "Tier 1 runs on schedule (5/10/15 min)",
+        "Tier 2 runs hourly or on trigger",
+        "Insights created with memory_supersedes links"
+      ],
+      "verification": [
+        "Store 50+ memories, wait for Tier 1",
+        "Trigger deep consolidation, verify insights"
+      ]
     },
     {
       "id": "T-P6",
       "title": "DMN / Idle Loop: spontaneous self-prompts + rumination",
       "intent": "Generate shower thoughts during agent idle time",
-      "depends_on": ["T-P3"],
+      "depends_on": [
+        "T-P3"
+      ],
       "priority": "P2",
       "status": "done",
       "owner": "ai",
       "deliverable": "brain/src/idle.py, rumination.py, dmn_store.py + GET /dmn/thoughts endpoint",
-      "acceptance_criteria": ["4 sampling channels produce diverse thoughts", "Rumination threads form and persist", "OpenClaw plugin polls and surfaces thoughts"],
-      "verification": ["Leave agent idle 10+ min, poll /dmn/thoughts", "Verify channel diversity"]
+      "acceptance_criteria": [
+        "4 sampling channels produce diverse thoughts",
+        "Rumination threads form and persist",
+        "OpenClaw plugin polls and surfaces thoughts"
+      ],
+      "verification": [
+        "Leave agent idle 10+ min, poll /dmn/thoughts",
+        "Verify channel diversity"
+      ]
     },
     {
       "id": "T-P7",
       "title": "Safety Monitor: ceilings + rate limiters + circuit breakers",
       "intent": "Prevent runaway memory weight escalation",
-      "depends_on": ["T-P5"],
+      "depends_on": [
+        "T-P5"
+      ],
       "priority": "P3",
       "status": "done",
       "owner": "ai",
       "deliverable": "brain/src/safety.py wired into MemoryStore",
-      "acceptance_criteria": ["Hard ceiling at 0.95", "Diminishing returns on reinforcement", "Audit log captures events"],
-      "verification": ["Reinforce memory repeatedly, verify ceiling", "Check audit log"]
+      "acceptance_criteria": [
+        "Hard ceiling at 0.95",
+        "Diminishing returns on reinforcement",
+        "Audit log captures events"
+      ],
+      "verification": [
+        "Reinforce memory repeatedly, verify ceiling",
+        "Check audit log"
+      ]
     },
     {
       "id": "T-P8",
       "title": "Bootstrap Readiness: 10-milestone maturation tracking",
       "intent": "Track new agent development from blank slate to fully mature",
-      "depends_on": ["T-P5", "T-P6"],
+      "depends_on": [
+        "T-P5",
+        "T-P6"
+      ],
       "priority": "P3",
       "status": "done",
       "owner": "ai",
       "deliverable": "brain/src/bootstrap.py + GET /bootstrap/status endpoint",
-      "acceptance_criteria": ["10 milestones with working checks", "Bootstrap prompt injected for new agents", "Milestones unlock progressively"],
-      "verification": ["New agent starts 0/10", "Store + retrieve + consolidate, verify milestones unlock"]
+      "acceptance_criteria": [
+        "10 milestones with working checks",
+        "Bootstrap prompt injected for new agents",
+        "Milestones unlock progressively"
+      ],
+      "verification": [
+        "New agent starts 0/10",
+        "Store + retrieve + consolidate, verify milestones unlock"
+      ]
     },
     {
       "id": "T-P9",
       "title": "Replace OpenClaw default AGENTS.md with brain-aware version",
       "intent": "Remove conflicting file-based memory instructions. Add web search guidance (D-020). Fix [[reply_to_current]] tag leak.",
-      "depends_on": ["T-P8"],
+      "depends_on": [
+        "T-P8"
+      ],
       "priority": "P1",
       "status": "done",
       "owner": "ai",
       "deliverable": "Custom AGENTS.md in openclaw-config workspace, [[reply_to_current]] fix, web search rules",
-      "acceptance_criteria": ["Agent system prompt has no references to SOUL.md/MEMORY.md/file-based memory", "Agent understands its memory comes from brain service", "No [[reply_to_current]] tag in agent output", "Web search guidance: brain memory trusted, LLM training data not, max 3 searches/turn"],
-      "verification": ["curl /context/assemble — no SOUL.md/MEMORY.md references", "Chat via WebChat — no tag leak in responses"]
+      "acceptance_criteria": [
+        "Agent system prompt has no references to SOUL.md/MEMORY.md/file-based memory",
+        "Agent understands its memory comes from brain service",
+        "No [[reply_to_current]] tag in agent output",
+        "Web search guidance: brain memory trusted, LLM training data not, max 3 searches/turn"
+      ],
+      "verification": [
+        "curl /context/assemble \u2014 no SOUL.md/MEMORY.md references",
+        "Chat via WebChat \u2014 no tag leak in responses"
+      ]
     },
     {
       "id": "T-P10",
       "title": "DMN observability: surface agent's inner monologue",
       "intent": "Make DMN thoughts, rumination threads, and consolidation insights visible.",
-      "depends_on": ["T-P8"],
+      "depends_on": [
+        "T-P8"
+      ],
       "priority": "P2",
       "status": "done",
       "owner": "ai",
       "deliverable": "Unified endpoint or dashboard showing DMN thoughts, active rumination threads, consolidation log entries, and tension memories",
-      "acceptance_criteria": ["Can see rumination thread content and history", "Can see DMN-generated thoughts with channel labels", "Can see consolidation insights and tension detections", "Can see what source_tag=internal_dmn memories were created"],
-      "verification": ["Leave agent idle, poll endpoint, verify thoughts appear", "Check rumination state shows thread progression"]
+      "acceptance_criteria": [
+        "Can see rumination thread content and history",
+        "Can see DMN-generated thoughts with channel labels",
+        "Can see consolidation insights and tension detections",
+        "Can see what source_tag=internal_dmn memories were created"
+      ],
+      "verification": [
+        "Leave agent idle, poll endpoint, verify thoughts appear",
+        "Check rumination state shows thread progression"
+      ]
     },
     {
       "id": "T-P12",
-      "title": "Identity w×s scoring + hash feature flag",
-      "intent": "Replace pure weight-rank identity selection with weight_center × cosine_sim scoring. Feature-flag identity hash to dormant. Corresponds to plan Phase 1.",
+      "title": "Identity w\u00d7s scoring + hash feature flag",
+      "intent": "Replace pure weight-rank identity selection with weight_center \u00d7 cosine_sim scoring. Feature-flag identity hash to dormant. Corresponds to plan Phase 1.",
       "depends_on": [],
       "priority": "P1",
       "status": "done",
       "owner": "ai",
-      "decisions": ["D-015", "D-017"],
+      "decisions": [
+        "D-015",
+        "D-017"
+      ],
       "plan": "state/plans/202602211500-identity-architecture-rework.md#phase-1",
-      "deliverable": "context_assembly.py: _get_top_identity_memories uses w×s instead of weight-rank. Identity hash behind ENABLE_IDENTITY_HASH env var (default false). api.py: identity endpoint respects flag.",
+      "deliverable": "context_assembly.py: _get_top_identity_memories uses w\u00d7s instead of weight-rank. Identity hash behind ENABLE_IDENTITY_HASH env var (default false). api.py: identity endpoint respects flag.",
       "acceptance_criteria": [
         "Identity memories scored by weight_center * cosine_sim(memory_emb, query_emb)",
         "Zero-relevance memories never injected regardless of weight",
@@ -271,17 +387,24 @@
         "GET /identity still works when flag is on",
         "No regression in /context/assemble response format"
       ],
-      "verification": ["Store diverse memories, call /context/assemble with specific query — only relevant high-weight memories injected", "Verify identity_hash empty in assembled context when flag off"]
+      "verification": [
+        "Store diverse memories, call /context/assemble with specific query \u2014 only relevant high-weight memories injected",
+        "Verify identity_hash empty in assembled context when flag off"
+      ]
     },
     {
       "id": "T-P13",
-      "title": "Injection logging + w×s analytics",
-      "intent": "Add injection_logs table to record every identity injection decision. Add metrics endpoint. Infrastructure for empirically validating the w×s formula. Corresponds to plan Phase 2.",
-      "depends_on": ["T-P12"],
+      "title": "Injection logging + w\u00d7s analytics",
+      "intent": "Add injection_logs table to record every identity injection decision. Add metrics endpoint. Infrastructure for empirically validating the w\u00d7s formula. Corresponds to plan Phase 2.",
+      "depends_on": [
+        "T-P12"
+      ],
       "priority": "P2",
       "status": "done",
       "owner": "ai",
-      "decisions": ["D-018d"],
+      "decisions": [
+        "D-018d"
+      ],
       "plan": "state/plans/202602211500-identity-architecture-rework.md#phase-2",
       "deliverable": "schema.sql: injection_logs table. context_assembly.py: log every injection decision. api.py: GET /injection/metrics endpoint.",
       "acceptance_criteria": [
@@ -290,17 +413,25 @@
         "GET /injection/metrics returns rolling stats (avg/p50/p75/p95 scores, injection rate, top memories)",
         "Logging is non-blocking (try/except wrapped)"
       ],
-      "verification": ["Call /context/assemble 10x, query injection_logs — all decisions logged", "Call /injection/metrics — stats populated"]
+      "verification": [
+        "Call /context/assemble 10x, query injection_logs \u2014 all decisions logged",
+        "Call /injection/metrics \u2014 stats populated"
+      ]
     },
     {
       "id": "T-P14",
       "title": "Semantic chunking + memory groups",
       "intent": "Enforce 300-token max at gate time via semantic chunking. Link chunks by memory_group_id. Group-wide beta refresh. Corresponds to plan Phase 3.",
-      "depends_on": ["T-P13"],
+      "depends_on": [
+        "T-P13"
+      ],
       "priority": "P2",
-      "status": "todo",
+      "status": "done",
       "owner": "ai",
-      "decisions": ["D-018b", "D-018c"],
+      "decisions": [
+        "D-018b",
+        "D-018c"
+      ],
       "plan": "state/plans/202602211500-identity-architecture-rework.md#phase-3",
       "deliverable": "schema.sql: memory_group_id column + index. gate.py: semantic chunking at storage. memory.py: group-wide touch. consolidation.py: insights inherit group_id.",
       "acceptance_criteria": [
@@ -310,17 +441,24 @@
         "store_insight assigns group_id when all sources share one",
         "Existing memories unaffected (group_id NULL = standalone)"
       ],
-      "verification": ["Store long content via gate — verify chunked into multiple memories with shared group_id", "Touch one chunk — verify all siblings refreshed"]
+      "verification": [
+        "Store long content via gate \u2014 verify chunked into multiple memories with shared group_id",
+        "Touch one chunk \u2014 verify all siblings refreshed"
+      ]
     },
     {
       "id": "T-P15",
       "title": "Adaptive context shift threshold",
       "intent": "Replace hardcoded 0.7 context shift threshold with P75 of last 200 shift values. Self-evolving. Corresponds to plan Phase 4.",
-      "depends_on": ["T-P13"],
+      "depends_on": [
+        "T-P13"
+      ],
       "priority": "P3",
-      "status": "todo",
+      "status": "done",
       "owner": "ai",
-      "decisions": ["D-018a"],
+      "decisions": [
+        "D-018a"
+      ],
       "plan": "state/plans/202602211500-identity-architecture-rework.md#phase-4",
       "deliverable": "context_assembly.py: ring buffer of last 200 context_shift values, P75 threshold computation, active identity caching between shifts.",
       "acceptance_criteria": [
@@ -330,7 +468,10 @@
         "Active identity cached and reused when shift < threshold",
         "Identity recomputed when shift >= threshold"
       ],
-      "verification": ["Call /context/assemble 200+ times with varying queries — verify threshold adapts", "Restart brain — verify ring buffer preserved"]
+      "verification": [
+        "Call /context/assemble 200+ times with varying queries \u2014 verify threshold adapts",
+        "Restart brain \u2014 verify ring buffer preserved"
+      ]
     },
     {
       "id": "T-B01",
@@ -340,14 +481,22 @@
       "priority": "P0",
       "status": "done",
       "owner": "ai",
-      "audit_ids": ["CQ-001", "CQ-002", "CQ-003", "CQ-004"],
+      "audit_ids": [
+        "CQ-001",
+        "CQ-002",
+        "CQ-003",
+        "CQ-004"
+      ],
       "deliverable": "memory.py: replace dir() with explicit None check. Batch access_count + alpha updates into single UPDATE WHERE id = ANY($1). Batch near-miss beta into single UPDATE WHERE id = ANY($1) AND NOT immutable. relevance.py: batch co-access UPSERT with executemany or UNNEST.",
       "acceptance_criteria": [
         "No dir() in codebase",
-        "apply_retrieval_mutation uses ≤5 SQL statements regardless of top_k/near_miss count",
+        "apply_retrieval_mutation uses \u22645 SQL statements regardless of top_k/near_miss count",
         "Safety checks still applied per-memory where needed"
       ],
-      "verification": ["grep -r 'dir()' brain/src — no hits", "Add query logging, call /memory/retrieve — count SQL statements"]
+      "verification": [
+        "grep -r 'dir()' brain/src \u2014 no hits",
+        "Add query logging, call /memory/retrieve \u2014 count SQL statements"
+      ]
     },
     {
       "id": "T-B02",
@@ -357,7 +506,10 @@
       "priority": "P1",
       "status": "done",
       "owner": "ai",
-      "audit_ids": ["CQ-005", "CQ-006"],
+      "audit_ids": [
+        "CQ-005",
+        "CQ-006"
+      ],
       "deliverable": "consolidation.py: _promote_patterns routes alpha boosts through safety.check_weight_change(). _decay_and_reconsolidate checks entropy monitor for large beta changes.",
       "acceptance_criteria": [
         "Promotion alpha boosts checked by HardCeiling + DiminishingReturns",
@@ -365,7 +517,10 @@
         "Deep decay (beta+=1.0) checked by entropy monitor",
         "Constant decay tick (beta+=0.01) exempt (too small to matter)"
       ],
-      "verification": ["Set memory alpha high, trigger promotion — verify ceiling enforced", "Check safety audit log shows promotion events"]
+      "verification": [
+        "Set memory alpha high, trigger promotion \u2014 verify ceiling enforced",
+        "Check safety audit log shows promotion events"
+      ]
     },
     {
       "id": "T-B03",
@@ -375,14 +530,19 @@
       "priority": "P1",
       "status": "done",
       "owner": "ai",
-      "audit_ids": ["CQ-019"],
+      "audit_ids": [
+        "CQ-019"
+      ],
       "deliverable": "Milestone checks revised to match actual system behavior: M5 checks dmn_log, M7 checks type=tension, M8 checks type=narrative.",
       "acceptance_criteria": [
         "All 10 bootstrap milestones are achievable through normal agent operation",
         "No milestone checks for conditions that no code path can produce",
         "Agent can progress from 0/10 to 10/10 through conversation + idle time"
       ],
-      "verification": ["Review each milestone check against code paths that could trigger it", "Simulate agent lifecycle — verify progressive milestone unlocking"]
+      "verification": [
+        "Review each milestone check against code paths that could trigger it",
+        "Simulate agent lifecycle \u2014 verify progressive milestone unlocking"
+      ]
     },
     {
       "id": "T-B04",
@@ -392,14 +552,20 @@
       "priority": "P2",
       "status": "done",
       "owner": "ai",
-      "audit_ids": ["CQ-008", "CQ-010"],
+      "audit_ids": [
+        "CQ-008",
+        "CQ-010"
+      ],
       "deliverable": "memory.py: embed_batch uses Gemini batch API (single call for multiple texts). gate.py: contradiction check reuses most_similar_id from check_novelty instead of re-searching.",
       "acceptance_criteria": [
         "embed_batch sends 1 API call per 100 texts (not 100 calls)",
         "Gate contradiction check does not re-embed or re-search",
         "No regression in embedding quality or gate accuracy"
       ],
-      "verification": ["Add request logging to embed, trigger consolidation — verify batch call count", "Add logging to gate, send contradictory content — verify single embed+search"]
+      "verification": [
+        "Add request logging to embed, trigger consolidation \u2014 verify batch call count",
+        "Add logging to gate, send contradictory content \u2014 verify single embed+search"
+      ]
     },
     {
       "id": "T-B05",
@@ -409,42 +575,71 @@
       "priority": "P2",
       "status": "done",
       "owner": "ai",
-      "audit_ids": ["CQ-025", "CQ-023", "CQ-014"],
+      "audit_ids": [
+        "CQ-025",
+        "CQ-023",
+        "CQ-014"
+      ],
       "deliverable": "idle.py: add minimum activation score threshold to _classify_channel. api.py: fix key to 'reason' matching rumination.py. consolidation.py: pass dict instead of json.dumps() for JSONB.",
       "acceptance_criteria": [
         "DMN channels distribute across goal/creative/identity/reflect (not all creative)",
         "Monologue endpoint shows actual resolution_reason for completed threads",
         "consolidation_log details column stores proper JSONB objects (not quoted strings)"
       ],
-      "verification": ["Leave agent idle, check dmn_log — verify channel diversity", "Complete rumination thread, check /monologue — reason populated", "Query consolidation_log: SELECT details->>'operation' — returns value not NULL"]
+      "verification": [
+        "Leave agent idle, check dmn_log \u2014 verify channel diversity",
+        "Complete rumination thread, check /monologue \u2014 reason populated",
+        "Query consolidation_log: SELECT details->>'operation' \u2014 returns value not NULL"
+      ]
     },
     {
       "id": "T-B06",
       "title": "Code hygiene: SQL duplication, dead code, minor fixes",
-      "intent": "Fix remaining medium/low audit findings. CQ-007 (duplicate _get_agent_ids), CQ-009 (dead where param), CQ-011 (monologue 3-query merge in Python), CQ-012 (O(n^2) clustering), CQ-013 (weight center SQL 20x), CQ-015 (dead flush_scratch), CQ-016 (manual emb string), CQ-017 (list→deque), CQ-018 (OutcomeTracker unwired), CQ-020 (magic 0.85), CQ-021 (adaptive_fifo_prune dead), CQ-022 (gut 50KB JSON/call), CQ-024 (leaked emb_arr).",
+      "intent": "Fix remaining medium/low audit findings. CQ-007 (duplicate _get_agent_ids), CQ-009 (dead where param), CQ-011 (monologue 3-query merge in Python), CQ-012 (O(n^2) clustering), CQ-013 (weight center SQL 20x), CQ-015 (dead flush_scratch), CQ-016 (manual emb string), CQ-017 (list\u2192deque), CQ-018 (OutcomeTracker unwired), CQ-020 (magic 0.85), CQ-021 (adaptive_fifo_prune dead), CQ-022 (gut 50KB JSON/call), CQ-024 (leaked emb_arr).",
       "depends_on": [],
       "priority": "P3",
-      "status": "todo",
+      "status": "done",
       "owner": "ai",
-      "audit_ids": ["CQ-007", "CQ-009", "CQ-011", "CQ-012", "CQ-013", "CQ-015", "CQ-016", "CQ-017", "CQ-018", "CQ-020", "CQ-021", "CQ-022", "CQ-024"],
-      "deliverable": "Consolidated cleanup pass across brain/src/. No behavioral changes — pure code quality.",
+      "audit_ids": [
+        "CQ-007",
+        "CQ-009",
+        "CQ-011",
+        "CQ-012",
+        "CQ-013",
+        "CQ-015",
+        "CQ-016",
+        "CQ-017",
+        "CQ-018",
+        "CQ-020",
+        "CQ-021",
+        "CQ-022",
+        "CQ-024"
+      ],
+      "deliverable": "Consolidated cleanup pass across brain/src/. No behavioral changes \u2014 pure code quality.",
       "acceptance_criteria": [
         "weight_center SQL expression defined once (SQL function or Python constant)",
         "_get_agent_ids in one place only",
         "Dead code removed or documented with TODO",
         "All tests still pass"
       ],
-      "verification": ["grep for duplicated patterns — single definition each", "docker compose build — no errors"]
+      "verification": [
+        "grep for duplicated patterns \u2014 single definition each",
+        "docker compose build \u2014 no errors"
+      ]
     },
     {
       "id": "T-P16",
       "title": "Consolidation research sessions with web search",
-      "intent": "Implement D-016: contradiction → LLM classifies → spawn agent research session with web search tools. 1/hour max, 24/day max.",
-      "depends_on": ["T-B02"],
+      "intent": "Implement D-016: contradiction \u2192 LLM classifies \u2192 spawn agent research session with web search tools. 1/hour max, 24/day max.",
+      "depends_on": [
+        "T-B02"
+      ],
       "priority": "P3",
-      "status": "todo",
+      "status": "done",
       "owner": "ai",
-      "decisions": ["D-016"],
+      "decisions": [
+        "D-016"
+      ],
       "deliverable": "consolidation.py: research session spawning, web search integration, budget tracking",
       "acceptance_criteria": [
         "Factual contradictions trigger LLM classification (factual/subjective, confidence)",
@@ -453,39 +648,61 @@
         "Rate limited: 1/hour, 24/day max",
         "Research results update memory weights appropriately"
       ],
-      "verification": ["Store two contradictory factual memories, trigger consolidation — verify research spawned", "Verify rate limits enforced"]
+      "verification": [
+        "Store two contradictory factual memories, trigger consolidation \u2014 verify research spawned",
+        "Verify rate limits enforced"
+      ]
     },
     {
       "id": "T-P17",
       "title": "HDBSCAN pattern detection overhaul",
       "intent": "Implement D-021: replace greedy cosine clustering with HDBSCAN. Per-cluster LLM analysis, 1/day, weighted-avg insight weights, 1-level recursion.",
-      "depends_on": ["T-B06"],
+      "depends_on": [
+        "T-B06"
+      ],
       "priority": "P3",
-      "status": "todo",
+      "status": "done",
       "owner": "ai",
-      "decisions": ["D-021"],
+      "decisions": [
+        "D-021"
+      ],
       "deliverable": "consolidation.py: HDBSCAN clustering, per-cluster analysis, cross-cluster summary, 1-level recursion, dedup at sim>0.85",
       "acceptance_criteria": [
         "Pattern detection uses HDBSCAN instead of greedy cosine",
         "Per-cluster LLM analysis produces typed insights",
-        "Cross-cluster summary with 1-level recursion (insights→meta-insights)",
+        "Cross-cluster summary with 1-level recursion (insights\u2192meta-insights)",
         "Meta-insights excluded from future clustering",
         "Insight weights = weighted average of source centers",
         "Dedup at sim>0.85"
       ],
-      "verification": ["Store 50+ diverse memories, trigger pattern detection — verify HDBSCAN clusters", "Check insights have weighted-avg weights from sources"]
+      "verification": [
+        "Store 50+ diverse memories, trigger pattern detection \u2014 verify HDBSCAN clusters",
+        "Check insights have weighted-avg weights from sources"
+      ]
     },
     {
       "id": "T-P11",
       "title": "Proactive notification system",
       "intent": "Allow agent to contact user outside conversation when research or DMN produces urgent/important results. Urgency (time-sensitive) triggers push notification. Importance (content significance) triggers passive mention next conversation. Neither depends on memory weight.",
-      "depends_on": ["T-P10"],
+      "depends_on": [
+        "T-P10"
+      ],
       "priority": "P3",
-      "status": "todo",
+      "status": "done",
       "owner": "ai",
       "deliverable": "notification_outbox DB table, importance/urgency scoring (weight + semantic + temporal), delivery worker (async, Telegram first), user notification preferences (channels, quiet hours, thresholds), passive injection for non-push notifications",
-      "acceptance_criteria": ["notification_outbox table created with urgency/importance scoring", "Delivery worker sends Telegram messages for urgent items", "Passive notifications injected into cognitive state for important non-urgent items", "Quiet hours respected", "User can configure channels and thresholds"],
-      "verification": ["Create urgent notification, verify Telegram delivery", "Create important notification, verify appears in next conversation context", "Set quiet hours, verify delivery delayed"]
+      "acceptance_criteria": [
+        "notification_outbox table created with urgency/importance scoring",
+        "Delivery worker sends Telegram messages for urgent items",
+        "Passive notifications injected into cognitive state for important non-urgent items",
+        "Quiet hours respected",
+        "User can configure channels and thresholds"
+      ],
+      "verification": [
+        "Create urgent notification, verify Telegram delivery",
+        "Create important notification, verify appears in next conversation context",
+        "Set quiet hours, verify delivery delayed"
+      ]
     },
     {
       "id": "T-S18",
@@ -507,26 +724,26 @@
         "Dedup prevents duplicate creation on next consolidation cycle"
       ],
       "verification": [
-        "SELECT count(*), avg(length(content)) FROM memories WHERE agent_id='default' — count reduced, avg length increased",
-        "docker compose restart brain && docker compose logs -f brain — no errors",
-        "Wait for consolidation cycle — check new insights are complete sentences (100+ chars)",
-        "Wait for DMN heartbeat — check _sample_fallback fires and samples a memory",
-        "Wait 1h — verify decay_tick only fires once (not 12 times)",
-        "Trigger consolidation — verify no new duplicates created (check_novelty catches them)"
+        "SELECT count(*), avg(length(content)) FROM memories WHERE agent_id='default' \u2014 count reduced, avg length increased",
+        "docker compose restart brain && docker compose logs -f brain \u2014 no errors",
+        "Wait for consolidation cycle \u2014 check new insights are complete sentences (100+ chars)",
+        "Wait for DMN heartbeat \u2014 check _sample_fallback fires and samples a memory",
+        "Wait 1h \u2014 verify decay_tick only fires once (not 12 times)",
+        "Trigger consolidation \u2014 verify no new duplicates created (check_novelty catches them)"
       ],
       "implementation_notes": {
         "files_changed": [
-          "brain/src/llm.py — removed max_output_tokens, thinking model runs unrestricted (BUG-001)",
-          "brain/src/consolidation.py — D-022: DECAY_TICK_INTERVAL 300->3600. D-023: all 4 creation paths (tensions, insights, narratives, revalidation) check_novelty at 0.85, reinforce existing via apply_retrieval_mutation instead of creating new",
-          "brain/src/memory.py — D-025: store_memory accepts initial_alpha/initial_beta. store_insight computes weighted-avg alpha/beta from sources (center-weighted). Removed source importance demotion.",
-          "brain/src/idle.py — D-024: _sample_fallback added. When all 4 channels return None, picks from ALL memories with probability proportional to weight center (floor 0.01)."
+          "brain/src/llm.py \u2014 removed max_output_tokens, thinking model runs unrestricted (BUG-001)",
+          "brain/src/consolidation.py \u2014 D-022: DECAY_TICK_INTERVAL 300->3600. D-023: all 4 creation paths (tensions, insights, narratives, revalidation) check_novelty at 0.85, reinforce existing via apply_retrieval_mutation instead of creating new",
+          "brain/src/memory.py \u2014 D-025: store_memory accepts initial_alpha/initial_beta. store_insight computes weighted-avg alpha/beta from sources (center-weighted). Removed source importance demotion.",
+          "brain/src/idle.py \u2014 D-024: _sample_fallback added. When all 4 channels return None, picks from ALL memories with probability proportional to weight center (floor 0.01)."
         ],
         "db_cleanup_plan": [
-          "Step 1: Identify keeper memories — for each duplicate cluster (sim>=0.95), keep the one with highest center (or highest access_count if tied)",
-          "Step 2: Delete non-keeper duplicates — DELETE FROM memories WHERE id IN (non-keeper-ids) AND agent_id='default'",
-          "Step 3: Clean orphaned supersedes links — DELETE FROM memory_supersedes WHERE source_id NOT IN (SELECT id FROM memories) OR insight_id NOT IN (SELECT id FROM memories)",
-          "Step 4: Verify — SELECT count(*), type, avg(length(content)) FROM memories WHERE agent_id='default' GROUP BY type",
-          "Step 5: Restart brain — docker compose up -d brain"
+          "Step 1: Identify keeper memories \u2014 for each duplicate cluster (sim>=0.95), keep the one with highest center (or highest access_count if tied)",
+          "Step 2: Delete non-keeper duplicates \u2014 DELETE FROM memories WHERE id IN (non-keeper-ids) AND agent_id='default'",
+          "Step 3: Clean orphaned supersedes links \u2014 DELETE FROM memory_supersedes WHERE source_id NOT IN (SELECT id FROM memories) OR insight_id NOT IN (SELECT id FROM memories)",
+          "Step 4: Verify \u2014 SELECT count(*), type, avg(length(content)) FROM memories WHERE agent_id='default' GROUP BY type",
+          "Step 5: Restart brain \u2014 docker compose up -d brain"
         ],
         "root_causes_fixed": {
           "BUG-001": "gemini-3-flash-preview thinking model consumed max_output_tokens budget with internal chain-of-thought. max_tokens=200 left ~20 tokens for actual output. Fix: removed max_output_tokens entirely.",

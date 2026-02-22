@@ -62,6 +62,7 @@ class GutFeeling:
         self._attention_count: int = 0
         self._last_delta: GutDelta | None = None
         self._delta_log: list[dict] = []  # recent deltas (metadata only), max 50
+        self._dirty: bool = False
 
     def update_subconscious(
         self,
@@ -91,6 +92,7 @@ class GutFeeling:
             self.subconscious_centroid = (weighted_sum / total_weight).astype(
                 np.float32
             )
+            self._dirty = True
         return self.subconscious_centroid
 
     def update_attention(self, embedding: list | np.ndarray) -> np.ndarray:
@@ -116,6 +118,7 @@ class GutFeeling:
             )
 
         self._attention_count += 1
+        self._dirty = True
         return self.attention_centroid
 
     def compute_delta(self, context: str = "") -> GutDelta | None:
@@ -160,6 +163,7 @@ class GutFeeling:
         if len(self._delta_log) > 50:
             self._delta_log = self._delta_log[-50:]
 
+        self._dirty = True
         return gut_delta
 
     @property
@@ -212,6 +216,8 @@ class GutFeeling:
         """Forward-link recent deltas for PCA analysis (Phase 7)."""
         for entry in self._delta_log[-last_n:]:
             entry["outcome_id"] = outcome_id
+        if self._delta_log:
+            self._dirty = True
 
     # ── Persistence ──────────────────────────────────────────────────
 
@@ -222,7 +228,9 @@ class GutFeeling:
         return agent_dir / "gut_state.json"
 
     def save(self) -> None:
-        """Persist gut state to disk."""
+        """Persist gut state to disk. Skips write if nothing changed."""
+        if not self._dirty:
+            return
         state: dict = {
             "agent_id": self.agent_id,
             "dimensions": self.dimensions,
@@ -244,6 +252,7 @@ class GutFeeling:
 
         path = self._state_path()
         path.write_text(json.dumps(state))
+        self._dirty = False
         logger.debug("Gut state saved for %s", self.agent_id)
 
     @classmethod

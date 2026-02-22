@@ -1,17 +1,16 @@
 """Safety monitor -- ceiling/limiter subsystem for weight mutation control."""
 
+import collections
 import logging
 import math
 import time
-import uuid
 from dataclasses import dataclass, field
 
 logger = logging.getLogger("brain.safety")
 
 # ── Module-level audit log ────────────────────────────────────────────
 
-_audit_log: list[dict] = []
-_MAX_AUDIT_LOG = 1000
+_audit_log: collections.deque[dict] = collections.deque(maxlen=1000)
 
 
 @dataclass
@@ -36,8 +35,6 @@ def log_safety_event(ceiling: str, action: str, reason: str, enforced: bool) -> 
     """Append to module audit log, capped at _MAX_AUDIT_LOG."""
     event = SafetyEvent(ceiling=ceiling, action=action, reason=reason, enforced=enforced)
     _audit_log.append(event.to_dict())
-    if len(_audit_log) > _MAX_AUDIT_LOG:
-        _audit_log.pop(0)
     level = "ENFORCED" if enforced else "SHADOW"
     logger.info("[%s] %s: %s -- %s", level, ceiling, action, reason)
 
@@ -443,83 +440,3 @@ class SafetyMonitor:
             },
             "audit_log_size": len(_audit_log),
         }
-
-
-# ── Outcome Tracker ──────────────────────────────────────────────────
-
-
-class OutcomeTracker:
-    """Records gate decisions, promotions, demotions for forward-linkable learning."""
-
-    MAX_RECORDS = 2000
-
-    def __init__(self):
-        self._records: list[dict] = []
-
-    def _add_record(self, record: dict) -> str:
-        outcome_id = f"out_{uuid.uuid4().hex[:12]}"
-        record["outcome_id"] = outcome_id
-        record["timestamp"] = time.time()
-        record["linked"] = False
-        record["result"] = None
-        record["quality"] = None
-        self._records.append(record)
-        if len(self._records) > self.MAX_RECORDS:
-            self._records.pop(0)
-        return outcome_id
-
-    def record_gate_decision(
-        self, memory_id: str, action: str, details: dict | None = None
-    ) -> str:
-        return self._add_record(
-            {
-                "type": "gate_decision",
-                "memory_id": memory_id,
-                "action": action,
-                "details": details or {},
-            }
-        )
-
-    def record_promotion(
-        self, memory_id: str, action: str, details: dict | None = None
-    ) -> str:
-        return self._add_record(
-            {
-                "type": "promotion",
-                "memory_id": memory_id,
-                "action": action,
-                "details": details or {},
-            }
-        )
-
-    def record_demotion(
-        self, memory_id: str, action: str, details: dict | None = None
-    ) -> str:
-        return self._add_record(
-            {
-                "type": "demotion",
-                "memory_id": memory_id,
-                "action": action,
-                "details": details or {},
-            }
-        )
-
-    def link_outcome(self, outcome_id: str, result: str, quality: float) -> bool:
-        """Forward-link an outcome for learning."""
-        for record in reversed(self._records):
-            if record.get("outcome_id") == outcome_id:
-                record["linked"] = True
-                record["result"] = result
-                record["quality"] = quality
-                return True
-        return False
-
-    def get_records(
-        self, record_type: str | None = None, limit: int = 50
-    ) -> list[dict]:
-        """Get recent records, optionally filtered by type."""
-        if record_type:
-            filtered = [r for r in self._records if r.get("type") == record_type]
-        else:
-            filtered = self._records
-        return list(filtered[-limit:])

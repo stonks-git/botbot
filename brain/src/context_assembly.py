@@ -9,12 +9,14 @@ D-005: Identity is the weights. No L0/L1 layers — identity emerges from
 high-weight memories in the unified table.
 D-015/DJ-005: injection_score = weight_center × cosine_sim. No floor.
 D-017/DJ-006: Identity hash feature-flagged dormant.
+D-018a: Adaptive context shift threshold — P75 of last 200 shift values.
 """
 
 import hashlib
 import logging
 
 from .activation import cosine_similarity
+from .config import WEIGHT_CENTER_SQL
 
 logger = logging.getLogger("brain.context")
 
@@ -36,10 +38,65 @@ IDENTITY_HASH_ENABLED = False
 IDENTITY_HASH_TOP_N = 10
 IDENTITY_FULL_TOP_N = 30
 
+# Adaptive context shift (D-018a)
+ADAPTIVE_SHIFT_BUFFER_SIZE = 200
+ADAPTIVE_SHIFT_DEFAULT = 0.5  # Bootstrap threshold when < 200 values
+
+# Identity cache — per-agent, invalidated when context_shift >= adaptive threshold
+_identity_cache: dict[str, list[dict]] = {}  # agent_id -> cached identity_candidates
+
 
 def _estimate_tokens(text: str) -> int:
     """Rough token estimate: ~4 chars per token."""
     return max(1, len(text) // 4)
+
+
+async def _get_adaptive_threshold(pool, agent_id: str) -> float:
+    """P75 of last 200 context_shift values. Returns bootstrap default if < 200 values."""
+    row = await pool.fetchrow(
+        """
+        SELECT count(*) AS cnt,
+               percentile_cont(0.75) WITHIN GROUP (ORDER BY shift_value) AS p75
+        FROM (
+            SELECT shift_value
+            FROM context_shift_buffer
+            WHERE agent_id = $1
+            ORDER BY created_at DESC
+            LIMIT $2
+        ) sub
+        """,
+        agent_id,
+        ADAPTIVE_SHIFT_BUFFER_SIZE,
+    )
+    if row["cnt"] < ADAPTIVE_SHIFT_BUFFER_SIZE:
+        return ADAPTIVE_SHIFT_DEFAULT
+    return float(row["p75"])
+
+
+async def _record_context_shift(pool, agent_id: str, shift_value: float) -> None:
+    """Append shift_value to the ring buffer and trim to 200 entries."""
+    try:
+        await pool.execute(
+            "INSERT INTO context_shift_buffer (agent_id, shift_value) VALUES ($1, $2)",
+            agent_id, shift_value,
+        )
+        # Trim: keep only the most recent ADAPTIVE_SHIFT_BUFFER_SIZE rows
+        await pool.execute(
+            """
+            DELETE FROM context_shift_buffer
+            WHERE agent_id = $1
+              AND id NOT IN (
+                  SELECT id FROM context_shift_buffer
+                  WHERE agent_id = $1
+                  ORDER BY created_at DESC
+                  LIMIT $2
+              )
+            """,
+            agent_id,
+            ADAPTIVE_SHIFT_BUFFER_SIZE,
+        )
+    except Exception:
+        logger.warning("Context shift buffer write failed for %s", agent_id)
 
 
 async def assemble_context(
@@ -79,23 +136,52 @@ async def assemble_context(
         parts["identity_hash"] = identity_hash
         used_tokens += _estimate_tokens(identity_hash)
 
-    # Active identity: w×s scored memories (D-015)
+    # Context shift (D-018a: computed early for identity cache gating)
+    context_shift = 1.0
+    if attention_embedding is not None and previous_attention_embedding is not None:
+        context_shift = 1.0 - cosine_similarity(
+            attention_embedding, previous_attention_embedding
+        )
+    adaptive_threshold = await _get_adaptive_threshold(
+        memory_store.pool, agent_id
+    )
+
+    # Active identity: w×s scored memories (D-015) with caching (D-018a)
     identity_tokens = 0
     identity_candidates = []
+    cache_hit = False
     if query_text:
-        try:
-            query_vec = await memory_store.embed(
-                query_text, task_type="RETRIEVAL_QUERY"
+        # Check identity cache — reuse if shift < adaptive threshold
+        if (
+            context_shift < adaptive_threshold
+            and agent_id in _identity_cache
+        ):
+            identity_candidates = _identity_cache[agent_id]
+            cache_hit = True
+            logger.debug(
+                "Identity cache hit for %s (shift=%.3f < threshold=%.3f)",
+                agent_id, context_shift, adaptive_threshold,
             )
-            identity_candidates = await memory_store.score_identity_wxs(
-                query_vec, agent_id, IDENTITY_TOP_N
+        else:
+            try:
+                query_vec = await memory_store.embed(
+                    query_text, task_type="RETRIEVAL_QUERY"
+                )
+                identity_candidates = await memory_store.score_identity_wxs(
+                    query_vec, agent_id, IDENTITY_TOP_N
+                )
+            except RuntimeError:
+                identity_candidates = []
+            # Cache the result
+            _identity_cache[agent_id] = identity_candidates
+            logger.debug(
+                "Identity recomputed for %s (shift=%.3f >= threshold=%.3f)",
+                agent_id, context_shift, adaptive_threshold,
             )
-        except RuntimeError:
-            identity_candidates = []
         for mem in identity_candidates:
             if identity_tokens >= BUDGET_IDENTITY_MAX:
                 break
-            content = mem["content"]
+            content = _annotate_chunk(mem)
             tokens = _estimate_tokens(content)
             if identity_tokens + tokens <= BUDGET_IDENTITY_MAX:
                 parts["identity_memories"].append(content)
@@ -142,18 +228,19 @@ async def assemble_context(
             memory_store, agent_id, query_text, situational_budget
         )
         for mem in situational:
-            parts["situational"].append(mem.get("compressed") or mem["content"])
+            content = mem.get("compressed") or mem["content"]
+            content = _annotate_chunk(mem, content)
+            parts["situational"].append(content)
             if mem.get("id"):
                 injected_memory_ids.append(mem["id"])
     used_tokens += sum(_estimate_tokens(s) for s in parts["situational"])
 
-    # Context inertia (Phase 4 wires attention embeddings)
-    context_shift = 1.0
-    if attention_embedding is not None and previous_attention_embedding is not None:
-        context_shift = 1.0 - cosine_similarity(
-            attention_embedding, previous_attention_embedding
-        )
-    inertia = 0.05 if context_shift > 0.7 else 0.3
+    # Context inertia (D-018a: adaptive threshold replaces hardcoded 0.7)
+    # context_shift already computed above for identity cache gating
+    inertia = 0.05 if context_shift > adaptive_threshold else 0.3
+
+    # Record shift value to ring buffer (non-blocking)
+    await _record_context_shift(memory_store.pool, agent_id, context_shift)
 
     conversation_budget = total_budget - used_tokens - BUDGET_OUTPUT_BUFFER
 
@@ -200,39 +287,6 @@ def render_system_prompt(context: dict) -> str:
     return "\n".join(sections).strip()
 
 
-def adaptive_fifo_prune(
-    conversation: list[dict],
-    budget: int,
-    intensity: float = 0.5,
-) -> tuple[list[dict], list[dict]]:
-    """Intensity-adaptive context pruning. Returns (kept, pruned)."""
-    if not conversation:
-        return [], []
-
-    if intensity > 0.7:
-        effective_budget = int(budget * 0.9)
-    elif intensity < 0.3:
-        effective_budget = int(budget * 0.35)
-    else:
-        effective_budget = budget
-
-    total = sum(_estimate_tokens(m.get("content", "")) + 4 for m in conversation)
-    if total <= effective_budget:
-        return conversation, []
-
-    kept: list[dict] = []
-    pruned: list[dict] = []
-    running = 0
-    for msg in reversed(conversation):
-        msg_tokens = _estimate_tokens(msg.get("content", "")) + 4
-        if running + msg_tokens <= effective_budget:
-            kept.insert(0, msg)
-            running += msg_tokens
-        else:
-            pruned.insert(0, msg)
-    return kept, pruned
-
-
 # ── Identity rendering (from unified memory) ────────────────────────
 
 
@@ -242,13 +296,13 @@ async def render_identity_hash(memory_store, agent_id: str) -> str:
     Replaces LayerStore.render_identity_hash() — identity IS the weights.
     """
     rows = await memory_store.pool.fetch(
-        """
+        f"""
         SELECT content, type, immutable,
-               depth_weight_alpha / (depth_weight_alpha + depth_weight_beta) AS center
+               {WEIGHT_CENTER_SQL} AS center
         FROM memories
         WHERE agent_id = $1
-          AND depth_weight_alpha / (depth_weight_alpha + depth_weight_beta) > 0.3
-        ORDER BY depth_weight_alpha / (depth_weight_alpha + depth_weight_beta) DESC
+          AND {WEIGHT_CENTER_SQL} > 0.3
+        ORDER BY {WEIGHT_CENTER_SQL} DESC
         LIMIT $2
         """,
         agent_id,
@@ -281,14 +335,14 @@ async def render_identity_full(memory_store, agent_id: str) -> str:
     Replaces LayerStore.render_identity_full() — groups by memory type.
     """
     rows = await memory_store.pool.fetch(
-        """
+        f"""
         SELECT content, type, immutable, confidence, importance,
                depth_weight_alpha, depth_weight_beta,
-               depth_weight_alpha / (depth_weight_alpha + depth_weight_beta) AS center
+               {WEIGHT_CENTER_SQL} AS center
         FROM memories
         WHERE agent_id = $1
-          AND depth_weight_alpha / (depth_weight_alpha + depth_weight_beta) > 0.2
-        ORDER BY depth_weight_alpha / (depth_weight_alpha + depth_weight_beta) DESC
+          AND {WEIGHT_CENTER_SQL} > 0.2
+        ORDER BY {WEIGHT_CENTER_SQL} DESC
         LIMIT $2
         """,
         agent_id,
@@ -344,6 +398,28 @@ async def render_identity_full(memory_store, agent_id: str) -> str:
             sections.append(f"- {r['content']} (weight: {center:.2f})")
 
     return "\n".join(sections) if sections else "Identity is bootstrapping."
+
+
+# ── Chunk annotation (D-018c) ────────────────────────────────────────
+
+
+def _annotate_chunk(mem: dict, content: str | None = None) -> str:
+    """Prepend [part N of M] to content if memory is a group chunk."""
+    if content is None:
+        content = mem.get("content", "")
+    meta = mem.get("metadata")
+    if isinstance(meta, str):
+        # asyncpg may return JSONB as string in some contexts
+        import json
+        try:
+            meta = json.loads(meta)
+        except (json.JSONDecodeError, TypeError):
+            meta = {}
+    if isinstance(meta, dict) and "group_part" in meta and "group_total" in meta:
+        part = meta["group_part"]
+        total = meta["group_total"]
+        return f"[part {part} of {total}] {content}"
+    return content
 
 
 # ── Private helpers ───────────────────────────────────────────────────

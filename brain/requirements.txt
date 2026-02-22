@@ -15,5 +15,8 @@ flashrank>=0.2
 pydantic>=2.0
 python-dotenv>=1.0
 
+# Clustering (D-021: HDBSCAN pattern detection)
+hdbscan>=0.8.38
+
 # Utilities
 numpy>=1.26

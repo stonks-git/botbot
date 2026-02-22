@@ -7,27 +7,94 @@
 
 ## Previous Sessions
 
-### SESSION 2026-02-22 (#26) - T-P13: Injection Logging + w×s Analytics (D-018d)
+### SESSION 2026-02-23 (#29) - T-P15 + T-P17 + T-P16 + T-P11 (4 P3 features)
 
 **STATUS:** DONE
 
 **What was done:**
 
-1. **injection_logs table** — SERIAL PK, 8 columns (agent_id, memory_id, weight_center, cosine_sim, injection_score, was_injected, query_hash, created_at), 3 indexes (agent+time, memory_id, query_hash). No FK constraints (log table convention). `brain/src/schema.sql`.
+1. **T-P15: Adaptive context shift threshold (D-018a)** — Added `context_shift_buffer` table (ring buffer of 200 values). `_get_adaptive_threshold()` returns P75 percentile (default 0.5 when < 200 values). Identity cache per agent (`_identity_cache`), invalidated when shift >= threshold. Replaced hardcoded 0.7 with adaptive threshold for inertia.
 
-2. **Injection decision logging** — After w×s identity scoring loop in `assemble_context()`, every candidate is logged with derived weight_center (alpha/(alpha+beta)), cosine_sim (injection_score/weight_center), and was_injected flag. Batch INSERT via `pool.executemany()`. Non-blocking (try/except). query_hash = SHA-256[:16] of query_text for turn grouping. `brain/src/context_assembly.py`.
+2. **T-P17: HDBSCAN pattern detection (D-021)** — Added `hdbscan>=0.8.38` to requirements. Added `insight_level` column migration. `_hdbscan_cluster()` function. Replaced `_pattern_detection()` body with HDBSCAN clustering, per-cluster LLM analysis (insight_level=1), cross-cluster meta-insights (insight_level=2). Schedule changed from 15min to 1/day. Added `build-essential` to Dockerfile.
 
-3. **GET /injection/metrics endpoint** — SQL percentiles via `percentile_cont(ARRAY[0.5, 0.75, 0.95])`, injection_rate, top-10 memories by injection count. Time-filtered by `days` param (default 7). Graceful on empty table. `brain/src/api.py`.
+3. **T-P16: Consolidation research sessions (D-016/DJ-008)** — Added `research_queue` table. `llm_call_with_search()` + retry wrapper using Gemini GoogleSearch tool. Research config constants. Classification, rate limiting, 2-search confirmation lifecycle. Structural confidence from grounding chunks. Safe mode: displacement only when 2 independent searches agree.
+
+4. **T-P11: Proactive notification system (D-019)** — Created `brain/src/notification.py` with NotificationStore + DeliveryWorker. Added `notification_outbox` + `notification_preferences` tables. Wired into api.py (lifespan + 4 endpoints + passive injection in /context/assemble), consolidation.py (contradiction + research triggers), idle.py (DMN goal/identity triggers).
+
+5. **Schema fix** — Added `memory_group_id` column migration (DO/EXCEPTION block) before `idx_memories_group` index to fix startup on existing DBs.
 
 | File | What was done |
 |------|---------------|
-| `brain/src/schema.sql` | injection_logs table + 3 indexes |
-| `brain/src/context_assembly.py` | import hashlib, identity_candidates init, injection logging block after w×s loop |
-| `brain/src/api.py` | InjectionMetricsResponse model + GET /injection/metrics endpoint |
-| `state/plans/202602211500-identity-architecture-rework.md` | Phase 2 decomposed + all 3 tasks checked + DONE |
-| `KB/KB_01_architecture.md` | injection_logs table, injection logging in context assembly, /injection/metrics endpoint |
+| `brain/src/schema.sql` | context_shift_buffer, notification_outbox, notification_preferences, research_queue tables. insight_level + memory_group_id migrations |
+| `brain/src/config.py` | Research constants, notification constants, research_finding type prefix |
+| `brain/src/context_assembly.py` | Adaptive threshold, identity cache, _get_adaptive_threshold(), _record_context_shift() |
+| `brain/src/consolidation.py` | HDBSCAN clustering, _hdbscan_cluster(), research methods (_classify, _queue, _process, _first, _confirmation), notification triggers |
+| `brain/src/memory.py` | insight_level param on store_insight() |
+| `brain/src/llm.py` | llm_call_with_search(), retry_llm_call_with_search() |
+| `brain/src/notification.py` | NEW: NotificationStore, DeliveryWorker |
+| `brain/src/api.py` | Notification imports/globals/lifespan/endpoints, passive injection in /context/assemble |
+| `brain/src/idle.py` | notification_store param, DMN/goal + DMN/identity notification triggers |
+| `brain/requirements.txt` | hdbscan>=0.8.38 |
+| `brain/Dockerfile` | build-essential for hdbscan C extension compilation |
+| `KB/KB_01_architecture.md` | DJ-008, all 4 features documented, dependency graph updated |
+| `state/roadmap.json` | T-P15/T-P17/T-P16/T-P11 → done, D-016 → superseded |
+
+### SESSION 2026-02-22 (#28) - T-B06: Code Hygiene Pass (11 audit findings)
+
+**STATUS:** DONE
+
+**What was done:**
+
+1. **Dead code removal (CQ-009/015/018/021)** — Removed `flush_scratch()` from memory.py (never called), `adaptive_fifo_prune()` from context_assembly.py (never called), `OutcomeTracker` class from safety.py (~75 lines, never instantiated), unused `where` param from `avg_depth_weight_center()`.
+
+2. **DRY constants (CQ-007/013/020)** — Extracted `WEIGHT_CENTER_SQL` and `NOVELTY_THRESHOLD` to config.py. Replaced 11+ inline SQL occurrences of `depth_weight_alpha / (depth_weight_alpha + depth_weight_beta)` across 8 files with f-string interpolation. Moved `_get_agent_ids()` to db.py as `get_agent_ids()`, removed duplicate definitions from idle.py and consolidation.py. `MERGE_SIMILARITY_THRESHOLD` and gate defaults now reference `NOVELTY_THRESHOLD`.
+
+3. **Minor fixes (CQ-016/017/022/024)** — Fixed `_sample_tension()` in idle.py: removed `embedding::float4[] AS emb_arr` + manual string formatting, pass `embedding` column directly, no-partner return no longer leaks full embedding array. Converted `_audit_log` in safety.py from `list[dict]` with manual `pop(0)` to `collections.deque(maxlen=1000)`. Added `_dirty` flag to gut.py `save()` — skips disk I/O when state hasn't changed.
+
+4. **Deferred** — CQ-011 (monologue UNION: already parallel via asyncio.gather), CQ-012 (O(n^2) clustering: T-P17 HDBSCAN replaces entirely).
+
+| File | What was done |
+|------|---------------|
+| `brain/src/config.py` | Added `NOVELTY_THRESHOLD = 0.85`, `WEIGHT_CENTER_SQL` constant |
+| `brain/src/db.py` | Added shared `get_agent_ids()` function |
+| `brain/src/memory.py` | Removed flush_scratch, fixed avg_depth_weight_center param, used NOVELTY_THRESHOLD + WEIGHT_CENTER_SQL |
+| `brain/src/safety.py` | Removed OutcomeTracker, deque for audit_log, replaced uuid with collections import |
+| `brain/src/context_assembly.py` | Removed adaptive_fifo_prune, used WEIGHT_CENTER_SQL |
+| `brain/src/gate.py` | Imported NOVELTY_THRESHOLD for confirming_sim + decision matrix |
+| `brain/src/consolidation.py` | Imported get_agent_ids/NOVELTY_THRESHOLD/WEIGHT_CENTER_SQL, removed duplicate helper |
+| `brain/src/idle.py` | Imported get_agent_ids/WEIGHT_CENTER_SQL, fixed _sample_tension emb_arr leak |
+| `brain/src/api.py` | Imported WEIGHT_CENTER_SQL for _get_identity_embeddings |
+| `brain/src/bootstrap.py` | Imported WEIGHT_CENTER_SQL for 3 milestone checks |
+| `brain/src/gut.py` | Added _dirty flag for save() optimization |
+| `KB/KB_01_architecture.md` | Config constants, removed dead code refs, updated dependency graph |
+| `state/devlog.ndjson` | 2 entries (refactor + kb_update) |
+| `state/roadmap.json` | T-B06 → done |
+
+### SESSION 2026-02-22 (#27) - T-P14: Semantic Chunking + Memory Groups (D-018b, D-018c)
+
+**STATUS:** DONE
+
+**What was done:**
+
+1. **memory_group_id column** — `TEXT` nullable column on memories table. Partial index `idx_memories_group ON memories (memory_group_id) WHERE memory_group_id IS NOT NULL`. `store_memory()` accepts optional `memory_group_id` parameter. `brain/src/schema.sql`, `brain/src/memory.py`.
+
+2. **Semantic chunking at gate time** — `semantic_chunk(text, max_tokens=300)` in gate.py: splits by paragraph (`\n\n`), then sentence boundaries, greedily merges under 300-token limit. Gate PERSIST path in api.py: content > 300 tokens → chunks stored as separate memories with shared `memory_group_id` and metadata `{group_part, group_total}`. `brain/src/gate.py`, `brain/src/api.py`.
+
+3. **Group-wide touch_memory** — `touch_memory()` queries `memory_group_id` of target memory. If non-NULL, UPDATEs `last_accessed` on all group siblings. Standalone memories (NULL group_id) use original single-row UPDATE. `brain/src/memory.py`.
+
+4. **Insight group_id inheritance + context annotation** — `store_insight()` queries source memories' `memory_group_id` values. If ALL share the same non-NULL group_id, insight inherits it. `score_identity_wxs()` now includes `metadata` column. `_annotate_chunk()` helper prepends `[part N of M]` to content in context assembly for chunked memories. `brain/src/memory.py`, `brain/src/context_assembly.py`.
+
+| File | What was done |
+|------|---------------|
+| `brain/src/schema.sql` | memory_group_id column + partial index |
+| `brain/src/memory.py` | store_memory memory_group_id param, store_insight group inheritance, group-wide touch_memory, score_identity_wxs +metadata |
+| `brain/src/gate.py` | semantic_chunk() function + _estimate_tokens helper |
+| `brain/src/api.py` | Gate PERSIST chunking path with group_id linking |
+| `brain/src/context_assembly.py` | _annotate_chunk() helper, identity + situational chunk annotation |
+| `state/plans/202602211500-identity-architecture-rework.md` | Phase 3 decomposed + all 4 tasks checked + DONE |
+| `KB/KB_01_architecture.md` | memory groups, semantic chunking, group-wide touch, chunk annotation |
 | `state/devlog.ndjson` | 2 entries (feature + kb_update) |
-| `state/roadmap.json` | T-P13 → done |
+| `state/roadmap.json` | T-P14 → done |
 
 ### SESSION 2026-02-22 (#25) - T-B05: DMN Channel Fix + Monologue Key + JSONB (CQ-025, CQ-023, CQ-014)
 
@@ -49,24 +116,6 @@
 | `KB/KB_01_architecture.md` | Updated _classify_channel, consolidation_log, monologue descriptions |
 | `state/devlog.ndjson` | 4 entries (3 bugfixes + kb_update) |
 | `state/roadmap.json` | T-B05 → done |
-
-### SESSION 2026-02-22 (#24) - T-B04: Batch Embedding + Gate Redundant Search (CQ-008, CQ-010)
-
-**STATUS:** DONE
-
-**What was done:**
-
-1. **CQ-008: True batch embedding.** Rewrote `embed_batch()` in memory.py to use Gemini's native batch API — passes `contents=[list]` to `embed_content()` in a single call per 100 texts, instead of N individual `embed()` calls via asyncio.gather. Retry logic (exponential backoff) preserved per chunk.
-
-2. **CQ-010: Gate triple-embed eliminated.** Added optional `embedding` parameter to `check_novelty()` — when provided, skips internal `embed()` call (backward compatible). `ExitGate.evaluate()` now: (a) embeds content once, (b) passes that embedding to `check_novelty()`, (c) fetches contradiction content via `get_memory(most_similar_id)` instead of re-embedding+re-searching via `search_similar()`. 3 embed API calls → 1 per gate evaluation.
-
-| File | What was done |
-|------|---------------|
-| `brain/src/memory.py` | CQ-008: Rewrote `embed_batch()` for true Gemini batch API. CQ-010: Added `embedding` param to `check_novelty()` |
-| `brain/src/gate.py` | CQ-010: Pass pre-computed embedding to check_novelty. Replace search_similar with get_memory for contradiction |
-| `KB/KB_01_architecture.md` | Updated memory method table, gate novelty description, dependency graph |
-| `state/devlog.ndjson` | 3 entries (2 bugfixes + kb_update) |
-| `state/roadmap.json` | T-B04 → done |
 
 ### SESSION 2026-02-22 (#23) - T-P12: Identity w×s Scoring + Hash Feature Flag (D-015, D-017)
 
@@ -106,6 +155,12 @@ BotBot bolts the intuitive-AI cognitive architecture (memory with Beta-distribut
 | T-B04 | DONE — True batch embedding + gate redundant search fix (CQ-008/CQ-010) |
 | T-B05 | DONE — DMN channel fix + monologue key + JSONB (CQ-025/CQ-023/CQ-014) |
 | T-P13 | DONE — Injection logging + w×s analytics (D-018d) |
+| T-P14 | DONE — Semantic chunking + memory groups (D-018b, D-018c) |
+| T-B06 | DONE — Code hygiene: dead code, DRY constants, deque, dirty flag, emb_arr fix (11/13 CQ items) |
+| T-P15 | DONE — Adaptive context shift threshold (D-018a) |
+| T-P17 | DONE — HDBSCAN pattern detection (D-021) |
+| T-P16 | DONE — Consolidation research sessions (D-016/DJ-008, safe 2-search mode) |
+| T-P11 | DONE — Proactive notification system (D-019) |
 
 ## Blockers or open questions
 
@@ -123,23 +178,23 @@ BotBot bolts the intuitive-AI cognitive architecture (memory with Beta-distribut
 | `[[reply_to_current]]` tag leaking into agent output | RESOLVED — T-P9: AGENTS.md instructs agent to never echo directive tags |
 | Where to see DMN/rumination output? | RESOLVED — T-P10: GET /monologue/{agent_id} endpoint + monologue plugin tool |
 | How to validate w×s formula empirically? | OPEN — D-018d logging pipeline needed first |
-| Consolidation pattern detection at scale | OPEN — D-021 HDBSCAN designed, not implemented |
+| Consolidation pattern detection at scale | RESOLVED — D-021 HDBSCAN implemented (T-P17) |
 
 ---
 
 ## Git Status
 
 - **Branch:** main
-- **Last commit:** ff18664 Sessions 18-19: Idle-state fixes, DB cleanup, AGENTS.md, DMN observability
-- **Modified (tracked):** KB/KB_01_architecture.md, brain/src/api.py, brain/src/bootstrap.py, brain/src/consolidation.py, brain/src/context_assembly.py, brain/src/gate.py, brain/src/idle.py, brain/src/memory.py, brain/src/relevance.py, brain/src/schema.sql, state/devlog.ndjson, state/handoff.md, state/roadmap.json
-- **New (untracked):** openclaw-workspace/.openclaw/, openclaw-workspace/BOOTSTRAP.md, etc.
+- **Last commit:** 0e97690 Sessions 20-26: Critical bugfixes, identity w×s scoring, injection logging
+- **Modified (tracked):** KB/KB_01_architecture.md, brain/Dockerfile, brain/requirements.txt, brain/src/api.py, brain/src/bootstrap.py, brain/src/config.py, brain/src/consolidation.py, brain/src/context_assembly.py, brain/src/db.py, brain/src/gate.py, brain/src/gut.py, brain/src/idle.py, brain/src/llm.py, brain/src/memory.py, brain/src/safety.py, brain/src/schema.sql, state/devlog.ndjson, state/handoff.md, state/plans/202602211500-identity-architecture-rework.md, state/roadmap.json
+- **New (untracked):** brain/src/notification.py, openclaw-workspace/.openclaw/, openclaw-workspace/BOOTSTRAP.md, etc.
 
 ---
 
 ## Memory Marker
 
 ```
-MEMORY_MARKER: 2026-02-22T17:00:00+02:00 | Session 26 complete (T-P13: D-018d) | injection_logs table + context_assembly logging + /injection/metrics endpoint. Plan Phase 2 DONE. | Next: T-B06 (code hygiene), T-P11 (proactive notifications), T-P14 (semantic chunking).
+MEMORY_MARKER: 2026-02-23T03:00:00+02:00 | Session 29 doc finalized | All 4 P3 features done. Plan marked done. D-016 status fixed (amended→superseded). All roadmap tasks complete. | Next: No remaining tasks. Ready for commit.
 ```
 
 ---

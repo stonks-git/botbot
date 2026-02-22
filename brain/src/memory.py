@@ -11,7 +11,7 @@ from typing import Any
 import asyncpg
 from google import genai
 
-from .config import EMBED_DIMENSIONS, EMBED_MODEL, MEMORY_TYPE_PREFIXES, RetryConfig
+from .config import EMBED_DIMENSIONS, EMBED_MODEL, MEMORY_TYPE_PREFIXES, NOVELTY_THRESHOLD, WEIGHT_CENTER_SQL, RetryConfig
 from .relevance import update_co_access
 
 logger = logging.getLogger("brain.memory")
@@ -141,6 +141,7 @@ class MemoryStore:
         source_tag: str | None = None,
         initial_alpha: float | None = None,
         initial_beta: float | None = None,
+        memory_group_id: str | None = None,
     ) -> str:
         mem_id = self._gen_id()
         prefixed = self.prefixed_content(content, memory_type)
@@ -152,11 +153,11 @@ class MemoryStore:
             INSERT INTO memories (
                 id, agent_id, content, type, embedding, created_at, updated_at,
                 source, tags, confidence, importance, evidence_count, metadata, source_tag,
-                depth_weight_alpha, depth_weight_beta
+                depth_weight_alpha, depth_weight_beta, memory_group_id
             ) VALUES (
                 $1, $2, $3, $4, $5::halfvec, $6, $7,
                 $8, $9, $10, $11, $12, $13, $14,
-                $15, $16
+                $15, $16, $17
             )
             """,
             mem_id,
@@ -175,8 +176,9 @@ class MemoryStore:
             source_tag or "external_user",
             initial_alpha if initial_alpha is not None else 1.0,
             initial_beta if initial_beta is not None else 4.0,
+            memory_group_id,
         )
-        logger.info("Stored memory %s (type=%s, agent=%s)", mem_id, memory_type, agent_id)
+        logger.info("Stored memory %s (type=%s, agent=%s, group=%s)", mem_id, memory_type, agent_id, memory_group_id)
         return mem_id
 
     async def store_insight(
@@ -187,6 +189,7 @@ class MemoryStore:
         importance: float = 0.8,
         tags: list[str] | None = None,
         metadata: dict | None = None,
+        insight_level: int = 1,
     ) -> str:
         """Store a consolidation insight and link to source memories.
 
@@ -194,14 +197,16 @@ class MemoryStore:
         skew more). Does NOT demote source importance — sources keep their weight
         until the insight proves itself through retrieval.
         """
-        # Compute inherited weights from sources
+        # Compute inherited weights and group_id from sources
         initial_alpha = 1.0
         initial_beta = 4.0
+        inherited_group_id = None
         if source_memory_ids:
             rows = await self.pool.fetch(
-                """
+                f"""
                 SELECT depth_weight_alpha, depth_weight_beta,
-                       depth_weight_alpha / (depth_weight_alpha + depth_weight_beta) AS center
+                       {WEIGHT_CENTER_SQL} AS center,
+                       memory_group_id
                 FROM memories
                 WHERE id = ANY($1) AND agent_id = $2
                 """,
@@ -219,6 +224,17 @@ class MemoryStore:
                         float(r["depth_weight_beta"]) * float(r["center"]) for r in rows
                     ) / total_weight
 
+                # D-018c: inherit group_id when ALL sources share the same one
+                group_ids = {r["memory_group_id"] for r in rows}
+                if len(group_ids) == 1:
+                    only_id = group_ids.pop()
+                    if only_id is not None:
+                        inherited_group_id = only_id
+
+        # Merge insight_level into metadata for query filtering
+        meta = dict(metadata) if metadata else {}
+        meta["insight_level"] = insight_level
+
         mem_id = await self.store_memory(
             content,
             agent_id,
@@ -226,10 +242,19 @@ class MemoryStore:
             source="consolidation",
             tags=tags,
             importance=importance,
-            metadata=metadata,
+            metadata=meta,
             initial_alpha=initial_alpha,
             initial_beta=initial_beta,
+            memory_group_id=inherited_group_id,
         )
+        # Set insight_level column directly (for DB-level filtering)
+        try:
+            await self.pool.execute(
+                "UPDATE memories SET insight_level = $1 WHERE id = $2",
+                insight_level, mem_id,
+            )
+        except Exception:
+            logger.warning("Failed to set insight_level=%d on %s", insight_level, mem_id)
         for src_id in source_memory_ids:
             await self.pool.execute(
                 """
@@ -352,7 +377,7 @@ class MemoryStore:
         query_vec = await self.embed(query, task_type="RETRIEVAL_QUERY")
 
         rows = await self.pool.fetch(
-            """
+            f"""
             WITH dense AS (
                 SELECT id, content, type, confidence, importance, access_count,
                        last_accessed, tags, source, created_at, embedding,
@@ -389,7 +414,7 @@ class MemoryStore:
                 EXP(-0.693 * EXTRACT(EPOCH FROM (NOW() - created_at)) / 604800.0) AS recency_score,
                 0.5 * (rrf_dense + rrf_sparse)
                   + 0.3 * EXP(-0.693 * EXTRACT(EPOCH FROM (NOW() - created_at)) / 604800.0)
-                  + 0.2 * (depth_weight_alpha / (depth_weight_alpha + depth_weight_beta)) AS weighted_score
+                  + 0.2 * ({WEIGHT_CENTER_SQL}) AS weighted_score
             FROM combined
             WHERE content IS NOT NULL
             ORDER BY weighted_score DESC
@@ -474,9 +499,9 @@ class MemoryStore:
         (handled by Track 0). Returns candidates ranked by injection_score.
         """
         rows = await self.pool.fetch(
-            """
-            SELECT id, content, depth_weight_alpha, depth_weight_beta,
-                   (depth_weight_alpha / (depth_weight_alpha + depth_weight_beta))
+            f"""
+            SELECT id, content, depth_weight_alpha, depth_weight_beta, metadata,
+                   ({WEIGHT_CENTER_SQL})
                      * (1 - (embedding <=> $1::halfvec)) AS injection_score
             FROM memories
             WHERE agent_id = $2
@@ -606,18 +631,41 @@ class MemoryStore:
 
         Used by gate novelty check — prevents decay for 24h
         but doesn't count as a real retrieval.
+        D-018c: If the memory belongs to a group, refreshes all group members.
         """
         now = datetime.now(timezone.utc)
-        await self.pool.execute(
-            """
-            UPDATE memories
-            SET last_accessed = $1, updated_at = $1
-            WHERE id = $2 AND agent_id = $3 AND NOT immutable
-            """,
-            now,
+
+        # Check if memory belongs to a group
+        group_id = await self.pool.fetchval(
+            "SELECT memory_group_id FROM memories WHERE id = $1 AND agent_id = $2",
             memory_id,
             agent_id,
         )
+
+        if group_id:
+            # Group-wide touch: refresh all siblings
+            await self.pool.execute(
+                """
+                UPDATE memories
+                SET last_accessed = $1, updated_at = $1
+                WHERE memory_group_id = $2 AND agent_id = $3 AND NOT immutable
+                """,
+                now,
+                group_id,
+                agent_id,
+            )
+        else:
+            # Standalone memory: touch only this one
+            await self.pool.execute(
+                """
+                UPDATE memories
+                SET last_accessed = $1, updated_at = $1
+                WHERE id = $2 AND agent_id = $3 AND NOT immutable
+                """,
+                now,
+                memory_id,
+                agent_id,
+            )
 
     # ── Scratch buffer ─────────────────────────────────────────────────
 
@@ -644,24 +692,6 @@ class MemoryStore:
         )
         return scratch_id
 
-    async def flush_scratch(
-        self,
-        agent_id: str,
-        older_than_minutes: int = 0,
-    ) -> list[dict]:
-        rows = await self.pool.fetch(
-            """
-            DELETE FROM scratch_buffer
-            WHERE agent_id = $1
-              AND buffered_at < NOW() - INTERVAL '1 minute' * $2
-              AND (expires_at IS NULL OR expires_at > NOW())
-            RETURNING *
-            """,
-            agent_id,
-            older_than_minutes,
-        )
-        return [dict(r) for r in rows]
-
     async def cleanup_expired_scratch(self, agent_id: str) -> int:
         result = await self.pool.execute(
             "DELETE FROM scratch_buffer WHERE agent_id = $1 AND expires_at < NOW()",
@@ -676,7 +706,7 @@ class MemoryStore:
         self,
         content: str,
         agent_id: str,
-        threshold: float = 0.85,
+        threshold: float = NOVELTY_THRESHOLD,
         embedding: list[float] | None = None,
     ) -> tuple[bool, float, str | None]:
         """Check if content is novel compared to existing memories.
@@ -740,10 +770,9 @@ class MemoryStore:
     async def avg_depth_weight_center(
         self,
         agent_id: str,
-        where: str | None = None,
     ) -> float:
-        query = """
-            SELECT AVG(depth_weight_alpha / (depth_weight_alpha + depth_weight_beta))
+        query = f"""
+            SELECT AVG({WEIGHT_CENTER_SQL})
             FROM memories WHERE agent_id = $1
         """
         result = await self.pool.fetchval(query, agent_id)

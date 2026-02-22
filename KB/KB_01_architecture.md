@@ -38,6 +38,7 @@ See `KB/blueprints/v0.3_current_state.md` for the current blueprint (done phases
 | DJ-005 | identity | D-015 floor dropped: pure weight×cosine_sim. Any floor creates immortal memories. | D-015 original | 2026-02-22 |
 | DJ-006 | identity | D-017 core/active split dropped, identity hash dormant. Core tier = immortal by construction. Values are dispositional, not declarative. | D-017 original | 2026-02-22 |
 | DJ-007 | consolidation | D-016 revised: agent research sessions with web search instead of internal LLM fact-check. Training data not reliable for verification. | D-016 original | 2026-02-22 |
+| DJ-008 | consolidation | D-016 amended: 2-search confirmation replaces single-search auto-displace. Research_queue table with pending→researched→confirmed lifecycle. | D-016 (DJ-007) | 2026-02-22 |
 
 ## Phase 1: Memory Core (implemented)
 
@@ -87,8 +88,8 @@ DELETE /memory/{memory_id}?agent_id=X
 |--------|------------|---------------------|
 | `embed(text, task_type, title)` | store/retrieve | all |
 | `embed_batch(texts, ...)` | — | consolidation (P5). True batch via Gemini API (CQ-008): 1 API call per 100 texts |
-| `store_memory(content, agent_id, ...)` | POST /store | all |
-| `store_insight(content, agent_id, source_ids, ...)` | — | consolidation (P5) |
+| `store_memory(content, agent_id, ..., memory_group_id=None)` | POST /store | all. D-018c: optional `memory_group_id` links chunks |
+| `store_insight(content, agent_id, source_ids, ...)` | — | consolidation (P5). D-018c: inherits `memory_group_id` when all sources share one |
 | `get_memory(id, agent_id)` | GET /{id} | all |
 | `get_random_memory(agent_id)` | — | DMN (P6) |
 | `memory_count(agent_id)` | /health | bootstrap (P8) |
@@ -99,9 +100,8 @@ DELETE /memory/{memory_id}?agent_id=X
 | `search_hybrid(query, agent_id, ...)` | POST /retrieve (mode=hybrid) | context assembly (P3) |
 | `search_reranked(query, agent_id, ...)` | POST /retrieve (mode=reranked) | — |
 | `apply_retrieval_mutation(ids, agent_id, ...)` | auto via search + context assembly | context assembly (P3), gate (P2) |
-| `touch_memory(memory_id, agent_id)` | — | gate (P2) novelty check |
+| `touch_memory(memory_id, agent_id)` | — | gate (P2) novelty check. D-018c: group-wide — refreshes all siblings when memory has `memory_group_id` |
 | `buffer_scratch(content, agent_id, ...)` | — | gate (P2) |
-| `flush_scratch(agent_id, ...)` | — | gate (P2) |
 | `cleanup_expired_scratch(agent_id)` | — | gate (P2) |
 | `check_novelty(content, agent_id, threshold, embedding=None)` → `(bool, float, str\|None)` | — | gate (P2), consolidation (P5). Optional pre-computed embedding skips internal embed (CQ-010) |
 | `get_stale_memories(agent_id, ...)` | — | consolidation (P5) |
@@ -113,7 +113,11 @@ DELETE /memory/{memory_id}?agent_id=X
 **Config constants** (`brain/src/config.py`):
 - `EMBED_MODEL = "gemini-embedding-001"`, `EMBED_DIMENSIONS = 3072`
 - `RetryConfig(max_retries=3, base_delay=1.0, max_delay=30.0)`
-- `MEMORY_TYPE_PREFIXES` — 8 types: episodic, semantic, procedural, preference, reflection, correction, narrative, tension
+- `MEMORY_TYPE_PREFIXES` — 9 types: episodic, semantic, procedural, preference, reflection, correction, narrative, tension, research_finding
+- `NOVELTY_THRESHOLD = 0.85` — shared similarity threshold for novelty/dedup checks (T-B06/CQ-020). Used by gate, memory, consolidation.
+- `WEIGHT_CENTER_SQL = "depth_weight_alpha / (depth_weight_alpha + depth_weight_beta)"` — canonical SQL expression for Beta weight center (T-B06/CQ-013). All SQL queries use this via f-string interpolation.
+- Research constants (D-016): `RESEARCH_HOURLY_LIMIT=1`, `RESEARCH_DAILY_LIMIT=24`, `RESEARCH_MIN_WEIGHT=0.3`, `RESEARCH_DISPLACE_BETA=5.0`, `RESEARCH_CONFIRMATION_HOURS=24`
+- Notification constants (D-019): `TELEGRAM_BOT_TOKEN_ENV`, `NOTIFICATION_DELIVERY_INTERVAL=30`, `NOTIFICATION_EXPIRY_HOURS=24`, `NOTIFICATION_MAX_PASSIVE_PER_CONTEXT=3`
 
 **Cross-module dependency graph** (Phase 1 only):
 ```
@@ -151,6 +155,7 @@ api.py          ← memory, db
 - Relevance axis: `spreading_activation(content_embedding, attention, layers)` → core (≥0.6) / peripheral (≥0.3) / irrelevant
 - Novelty axis: `check_novelty(embedding=content_embedding)` → `(is_novel, max_similarity, most_similar_id)` + `detect_contradiction_negation()` → confirming (sim≥0.85) / novel (sim<0.6) / contradicting (sim≥0.7 + negation markers). Single embed call reused for both spreading_activation and novelty check (CQ-010). Contradiction fetches content via `get_memory(most_similar_id)` instead of re-searching.
 - **Gate touch** (D-012): after novelty check, calls `touch_memory(most_similar_id)` — refreshes `last_accessed` only (no access_count, no alpha/beta). Prevents decay for 24h on referenced memories. "Stay of execution, not a promotion."
+- **Semantic chunking** (D-018b): `semantic_chunk(text, max_tokens=300)` splits by paragraph (`\n\n`) then sentence boundaries (`.`/`!`/`?`), greedily merges under 300-token limit. Single oversized sentences kept whole. Used by gate PERSIST path.
 - Score: `base_score * (0.5 + 0.5 * s_i) * hunger_boost + emotional_charge_bonus`
 - **Hunger curve** (D-009): dynamic score multiplier based on memory count. Newborn agents (0 memories) get `hunger_max_boost=2.5`, decaying exponentially (`exp(-count/10)`) toward 1.0 as memories accumulate. When hunger-boosted score ≥ 0.5 and hunger > 1.05, BUFFER is promoted to PERSIST. This solves the cold-start problem where newborn agents couldn't form memories because everything scored as peripheral×novel→buffer.
 - Noise floor: 2% chance DROP → BUFFER
@@ -163,7 +168,7 @@ POST /memory/gate
   Response: { decision, score, memory_id?, scratch_id?, entry_gate: {...}, exit_gate: {...} }
 ```
 Pipeline: entry gate → scratch buffer → exit gate → act on decision:
-- PERSIST/PERSIST_HIGH/PERSIST_FLAG → `store_memory()` with importance derived from gate score
+- PERSIST/PERSIST_HIGH/PERSIST_FLAG → if content > 300 tokens: `semantic_chunk()` splits into chunks, each stored with shared `memory_group_id` and metadata `{group_part, group_total}`. If ≤ 300 tokens: single `store_memory()`. Importance derived from gate score.
 - REINFORCE → find most similar memory + `apply_retrieval_mutation()`
 - BUFFER → leave in scratch (24h TTL, consolidation picks up later)
 
@@ -212,7 +217,7 @@ api.py          ← memory, gate, db
 **Brain modules:**
 - `brain/src/context_assembly.py` — dynamic context injection + identity rendering:
   - `assemble_context(memory_store, agent_id, ...)` — Track 0 (immutable safety) + active identity (D-015: w×s scored) + Track 1 (situational via `search_hybrid(mutate=False)`). Returns `injected_memory_ids` — IDs of non-immutable memories that survived budget trimming and were actually injected.
-  - **Active identity (D-015/DJ-005):** Embeds `query_text` with `RETRIEVAL_QUERY` task type, calls `memory_store.score_identity_wxs(query_vec, agent_id)` which computes `injection_score = weight_center × cosine_sim` in SQL via pgvector `<=>`. Memories ranked by injection_score, injected within `BUDGET_IDENTITY_MAX` token budget. No query = no identity injection (relevance is mandatory per DJ-005). Replaces stochastic Beta-sampling.
+  - **Active identity (D-015/DJ-005):** Embeds `query_text` with `RETRIEVAL_QUERY` task type, calls `memory_store.score_identity_wxs(query_vec, agent_id)` which computes `injection_score = weight_center × cosine_sim` in SQL via pgvector `<=>`. Memories ranked by injection_score, injected within `BUDGET_IDENTITY_MAX` token budget. No query = no identity injection (relevance is mandatory per DJ-005). Replaces stochastic Beta-sampling. D-018c: chunked memories annotated with `[part N of M]` prefix via `_annotate_chunk()` from metadata `group_part`/`group_total`.
   - **Identity hash (D-017/DJ-006):** Feature-flagged dormant via `IDENTITY_HASH_ENABLED = False`. `render_identity_hash()` skipped during assembly but still callable via API endpoints.
   - **Retrieval mutation** (D-012): after assembly, `api.py` calls `apply_retrieval_mutation(injected_ids)` — increments `access_count` + boosts `depth_weight_alpha` for memories that influenced the agent's output. access_count always increments (factual counter); alpha boost goes through safety check (D-013).
   - Token budgets: identity max 3000, situational 2000, output buffer 4000
@@ -220,9 +225,9 @@ api.py          ← memory, gate, db
   - `render_identity_hash(memory_store, agent_id)` — compact ~100-200 tokens from top-10 memories by weight center (used by API only when hash dormant)
   - `render_identity_full(memory_store, agent_id)` — full ~1-2k tokens grouped by memory type from top-30 memories (replaces LayerStore.render_identity_full)
   - **Injection logging (D-018d):** After w×s scoring, every candidate is logged to `injection_logs` table with weight_center, cosine_sim, injection_score, was_injected (budget-accepted or not), query_hash (SHA-256[:16] of query_text). Non-blocking (try/except wrapped). Batch INSERT via `pool.executemany()`.
-  - `adaptive_fifo_prune()` — intensity-adaptive context pruning (for future use)
-  - Context inertia: shift = 1-cosine(current, previous attention), inertia 5% if shift>0.7, else 30% (Phase 4 wires attention)
-- `brain/src/memory.py` — `score_identity_wxs(query_vec, agent_id, top_n)` — SQL-native w×s identity scoring. Computes `(alpha/(alpha+beta)) * (1 - (embedding <=> query::halfvec))` in DB. Excludes immutables. Returns candidates ranked by injection_score DESC.
+  - **Adaptive context shift threshold (D-018a, T-P15):** Ring buffer of last 200 context_shift values in `context_shift_buffer` table. Threshold = P75 percentile. Bootstrap default 0.5 when < 200 values. Identity candidates cached per agent (`_identity_cache`), recomputed only when `context_shift >= threshold`. Shift values recorded non-blocking.
+  - Context inertia: shift = 1-cosine(current, previous attention). Inertia 5% if shift > adaptive threshold (was hardcoded 0.7), else 30%.
+- `brain/src/memory.py` — `score_identity_wxs(query_vec, agent_id, top_n)` — SQL-native w×s identity scoring. Computes `(alpha/(alpha+beta)) * (1 - (embedding <=> query::halfvec))` in DB. Excludes immutables. Returns candidates ranked by injection_score DESC. Includes `metadata` column for chunk annotation.
 
 **Gate wiring — `_get_identity_embeddings()` in `api.py`:**
 - Queries top-N memories by weight center (`depth_weight_alpha / (depth_weight_alpha + depth_weight_beta) > 0.3`) from DB
@@ -315,14 +320,17 @@ api.py               <- memory, gate, context_assembly, gut, db, numpy
 **Brain modules:**
 - `brain/src/llm.py` -- Google Gemini client wrapper (D-006):
   - `retry_llm_call(prompt, max_tokens, temperature, model, retry_config)` -- async with exponential backoff retry
+  - `llm_call_with_search(prompt, temperature=1.0)` -- Gemini with GoogleSearch grounding tool (D-016). Returns (text, sources, grounding_chunk_count). Temperature 1.0 recommended for Gemini 3 with tools.
+  - `retry_llm_call_with_search(prompt, ...)` -- retry wrapper for search-grounded calls
   - Model: `gemini-3-flash-preview` for all consolidation/DMN prompts
   - Uses `google-genai` SDK, reads `GOOGLE_API_KEY` from env
 
 - `brain/src/consolidation.py` -- background memory processing:
   - **Tier 1 (ConstantConsolidation)** -- 30s loop, 3 scheduled operations:
     - `_decay_tick()` every 1 hour (D-022, was 5min): beta += 0.01 for stale memories (24h+ not accessed, non-immutable, center > 0.1). Decay pressure: 0.01 beta/hr (was 0.12).
-    - `_contradiction_scan()` every 10min: fetch 10 recent memories, 2 random pairs, LLM contradiction check. D-023: novelty-checked at sim>=0.85 before storing, reinforces existing if duplicate.
-    - `_pattern_detection()` every 15min: fetch 50 recent memories (7d), greedy cosine cluster at 0.85, log clusters with 3+ members
+    - `_contradiction_scan()` every 10min: fetch 10 recent memories, 2 random pairs, LLM contradiction check. D-023: novelty-checked at sim>=0.85 before storing, reinforces existing if duplicate. D-016/DJ-008: after each pair, calls `_maybe_queue_research()` to classify factual contradictions and queue for 2-search confirmation. At end, calls `_process_research_queue()`. Enqueues notifications (D-019) on contradiction detection.
+    - **Research sessions (D-016/DJ-008):** `_maybe_queue_research()` → checks weight centers (skip if both < 0.3), skips user-sourced memories, rate-limits (1/hour, 24/day), classifies via `_classify_contradiction()` (LLM: factual/subjective + confidence + research_worthy). Factual + confidence>0.7 → INSERT into `research_queue`. `_process_research_queue()` → 1st search via `retry_llm_call_with_search()` (Google Search grounding), structural confidence from grounding_chunk_count (0=UNRESOLVED, 1=LOW, 2+=MEDIUM), stores `type=research_finding` memory. 24h later → 2nd search with rephrased prompt. Displacement only if both searches agree + MEDIUM confidence → beta += 5.0 on loser via safety. Enqueues notifications on MEDIUM findings and confirmed displacements.
+    - `_pattern_detection()` every 24h (D-021, was 15min): HDBSCAN clustering on pre-filtered memories (weight>0.25, access>=2, insight_level<2). Per-cluster LLM analysis generates typed insights (insight_level=1). Cross-cluster meta-insight (insight_level=2) from 2+ cluster insights. Meta-insights excluded from future clustering. Dedup via check_novelty before each storage.
   - **Tier 2 (DeepConsolidation)** -- hourly or triggered:
     - `_merge_and_insight()`: LLM generates questions from recent memories, extracts insights via search_similar + LLM. D-023: novelty-checked, if sim>=0.85 reinforces existing via apply_retrieval_mutation instead of creating new. Clusters reflections into first-person narratives (also novelty-checked).
     - `_promote_patterns()`: D-005 simplified. Goal promotion (5+ access, 14d+, center<0.65, alpha+=2.0). Identity promotion (10+ access, 30d+, center 0.65-0.82, alpha+=5.0). **CQ-005 fix:** all alpha boosts routed through `safety.check_weight_change()` — HardCeiling (0.95) and DiminishingReturns enforced. Blocked promotions counted and logged.
@@ -387,7 +395,7 @@ api.py               <- memory, gate, context_assembly, gut, consolidation, db, 
 
 - `brain/src/idle.py` — DMN idle loop:
   - `IdleLoop`: main background loop (same pattern as consolidation.py — `asyncio.wait_for(shutdown_event.wait(), timeout=...)`)
-  - Constructor: `IdleLoop(pool, memory_store, thought_queue, gut_getter)`. `gut_getter` is `_get_gut` callable injected from api.py to avoid circular imports.
+  - Constructor: `IdleLoop(pool, memory_store, thought_queue, gut_getter, notification_store=None)`. `gut_getter` is `_get_gut` callable injected from api.py to avoid circular imports. D-019: `notification_store` passed for DMN/goal and DMN/identity channel notifications (urgency=0.1, importance=0.6).
   - Per-agent heartbeat intervals based on idle duration: <10min → 60s, 10-60min → 300s, 1-4h → 900s, 4h+ → 1800s. Loop sleeps at 30s, skips agents whose interval hasn't elapsed.
   - **4 Sampling Channels** (roll [0-1)):
     - Neglected (35%): high weight center > 0.5, last_accessed > 7 days ago
@@ -448,8 +456,7 @@ GET  /monologue/{agent_id}?limit=50
   - **Phase B (consolidation-time, disabled by default):** RateLimiter (MAX_CHANGE_PER_CYCLE=0.10 per memory) + TwoGateGuardrail (evidence quality gate + 50 changes/cycle cap)
   - **Phase C (mature agent, disabled by default):** EntropyMonitor (ENTROPY_FLOOR=2.0 bits, 20-bin histogram) + CircuitBreaker (MAX_CONSECUTIVE=5 same-evidence reinforcements)
   - **SafetyMonitor** coordinator: `check_weight_change()` -> (allowed, adj_delta_alpha, adj_delta_beta, reasons). Synchronous (no async). `enable_phase_b()`, `enable_phase_c()`, `end_consolidation_cycle(cycle_id)`
-  - **OutcomeTracker**: records gate_decision/promotion/demotion events, forward-linkable via `link_outcome()`, max 2000 records
-  - Module-level `_audit_log` (list[dict], max 1000), `log_safety_event()`, `get_audit_log()`
+  - Module-level `_audit_log` (deque, maxlen=1000), `log_safety_event()`, `get_audit_log()`
 - Wired in `api.py` lifespan: `SafetyMonitor()` -> `_memory_store.safety`
 - Wired in `consolidation.py`: `_deep_cycle()` calls `safety.enable_phase_b()` at start, `safety.end_consolidation_cycle(cycle_id)` at end (in finally block). `_current_cycle_id` instance attribute on DeepConsolidation plumbs cycle_id to step functions (`_promote_patterns`, `_decay_and_reconsolidate`) for Phase B rate limiting.
 - `memory.py:422-431`: existing call site uses `self.safety.check_weight_change()` for retrieval mutation -- now active
@@ -464,17 +471,19 @@ config.py            <- standalone
 stochastic.py        <- standalone
 activation.py        <- numpy
 relevance.py         <- activation
-safety.py            <- standalone (math, logging, uuid only)
+safety.py            <- standalone (collections, math, logging only)
+db.py                <- asyncpg (pool + get_agent_ids)
 memory.py            <- config, relevance, db (pool); safety wired at runtime
-gate.py              <- activation, memory
-gut.py               <- activation (cosine_similarity), numpy, json, pathlib
-context_assembly.py  <- activation (cosine_similarity)
+gate.py              <- activation, config (NOVELTY_THRESHOLD)
+bootstrap.py         <- config (WEIGHT_CENTER_SQL), asyncpg
+gut.py               <- numpy, json, pathlib
+context_assembly.py  <- activation (cosine_similarity), config (WEIGHT_CENTER_SQL)
 llm.py               <- config (RetryConfig), google-genai
-consolidation.py     <- llm, memory, activation, numpy, asyncpg; safety via memory.store.safety
+consolidation.py     <- llm, memory, activation, config (NOVELTY_THRESHOLD, WEIGHT_CENTER_SQL), db (get_agent_ids), numpy, asyncpg
 rumination.py        <- json, pathlib (standalone)
 dmn_store.py         <- asyncio (standalone)
-idle.py              <- rumination, dmn_store, llm, memory, relevance (spread_activation), asyncpg
-api.py               <- memory, gate, context_assembly, gut, consolidation, idle, dmn_store, safety, db, numpy
+idle.py              <- rumination, dmn_store, llm, memory, config (WEIGHT_CENTER_SQL), db (get_agent_ids), relevance, asyncpg
+api.py               <- memory, gate, context_assembly, gut, consolidation, idle, dmn_store, safety, config (WEIGHT_CENTER_SQL), db, numpy
 ```
 
 ## Phase 8: Bootstrap Readiness (implemented)
@@ -500,25 +509,72 @@ api.py               <- memory, gate, context_assembly, gut, consolidation, idle
 **API** (1 new endpoint, version 0.7.0):
 - `GET /bootstrap/status?agent_id=X` -> BootstrapStatusResponse: { agent_id, milestones, achieved, total, ready, bootstrap_prompt, status_text }
 
-**Cross-module dependency graph** (Phase 1-8):
+**Cross-module dependency graph** (Phase 1-8 + D-019):
 ```
 config.py            <- standalone
 stochastic.py        <- standalone
 activation.py        <- numpy
 relevance.py         <- activation
-safety.py            <- standalone (math, logging, uuid only)
+safety.py            <- standalone (collections, math, logging only)
 memory.py            <- config, relevance, db (pool); safety wired at runtime
 gate.py              <- activation, memory
 gut.py               <- activation (cosine_similarity), numpy, json, pathlib
 context_assembly.py  <- activation (cosine_similarity)
 llm.py               <- config (RetryConfig), google-genai
-consolidation.py     <- llm, memory, activation, numpy, asyncpg; safety via memory.store.safety
+notification.py      <- config, asyncpg (standalone)
+consolidation.py     <- llm, memory, activation, numpy, asyncpg, hdbscan; safety via memory.store.safety; notification optional
 rumination.py        <- json, pathlib (standalone)
 dmn_store.py         <- asyncio (standalone)
-idle.py              <- rumination, dmn_store, llm, memory, relevance (spread_activation), asyncpg
+idle.py              <- rumination, dmn_store, llm, memory, relevance (spread_activation), asyncpg; notification optional
 bootstrap.py         <- asyncpg (standalone, DB-direct queries only)
-api.py               <- memory, gate, context_assembly, gut, consolidation, idle, dmn_store, safety, bootstrap, db, numpy
+api.py               <- memory, gate, context_assembly, gut, consolidation, idle, dmn_store, safety, bootstrap, notification, db, numpy
 ```
+
+## Proactive Notification System (D-019, T-P11, implemented)
+
+**Brain module** (`brain/src/notification.py`):
+- `NotificationStore(pool)` — outbox CRUD:
+  - `enqueue(agent_id, content, urgency, importance, source, ...)` — auto-routes to channel based on preferences. High urgency + telegram_enabled → `channel='telegram'`, otherwise `channel='passive'`.
+  - `get_pending_push(limit)` — pending telegram/webhook notifications (delivery worker polls this)
+  - `get_pending_passive(agent_id, limit)` — pending passive notifications for context injection
+  - `mark_delivered(id)`, `mark_failed(id, error)`, `expire_old()`
+  - `get_preferences(agent_id)` / `set_preferences(agent_id, **kwargs)` — per-agent prefs upsert
+- `DeliveryWorker(pool, store)` — background loop (same pattern as IdleLoop):
+  - Polls pending push notifications every 30s
+  - Delivers via Telegram Bot API (urllib.request, no extra dependency)
+  - Respects quiet hours (handles midnight wrapping)
+  - Expires old notifications past 24h TTL
+  - Marks delivered/failed on each attempt
+
+**DB tables** (`schema.sql`):
+```sql
+notification_outbox (id SERIAL PK, agent_id, content, urgency, importance, source, source_memory_id, channel, status, metadata JSONB, created_at, delivered_at, expires_at)
+notification_preferences (agent_id TEXT PK, telegram_chat_id, telegram_enabled, quiet_hours_start/end, urgency_threshold, importance_threshold, enabled, updated_at)
+```
+
+**Wiring:**
+- `api.py` lifespan: `NotificationStore(pool)` initialized, passed to `ConsolidationEngine` and `IdleLoop`. `DeliveryWorker` started as background task.
+- `consolidation.py`: `ConstantConsolidation` and `DeepConsolidation` accept `notification_store`. Enqueues notifications on: contradiction detection (urgency=0.3), MEDIUM research findings (urgency=0.5), confirmed research displacements (urgency=0.5).
+- `idle.py`: `IdleLoop` accepts `notification_store`. Enqueues notifications for DMN/goal and DMN/identity channels (urgency=0.1, importance=0.6).
+- `/context/assemble`: fetches up to 3 pending passive notifications, appends to cognitive_state_report under `[Pending Notifications]`, marks delivered.
+
+**API endpoints** (version 0.8.0):
+```
+GET  /notifications/pending?agent_id=X
+  Response: { agent_id, notifications: [...], count }
+
+POST /notifications/preferences
+  Request:  { agent_id, telegram_chat_id?, telegram_enabled?, quiet_hours_start?, quiet_hours_end?, urgency_threshold?, importance_threshold?, enabled? }
+  Response: { agent_id, preferences: {...} }
+
+GET  /notifications/preferences/{agent_id}
+  Response: { agent_id, preferences: {...} }
+
+GET  /notifications/status
+  Response: { delivery_worker_running, store_initialized }
+```
+
+**Key design:** Urgency (time-sensitive) != importance (content significance) != weight. Channel routing by urgency threshold + telegram availability. Passive notifications injected into next /context/assemble call.
 
 ## OpenClaw Agent Runtime (implemented)
 
@@ -673,6 +729,13 @@ Brain memory = trusted. LLM training data = NOT trusted. Agent must verify facts
 - **Now:** (D-012) Two mutation types: context injection does full mutation (access_count + alpha), gate touch refreshes last_accessed only. (D-013) access_count separated from alpha boost — safety can't block counting. `assemble_context()` returns `injected_memory_ids`, `api.py` calls `apply_retrieval_mutation()` on them. `check_novelty()` returns 3-tuple with memory ID for gate touch.
 - **Why:** The system was designed for feedback (gate uses identity embeddings from high-weight memories, memories gain weight from retrieval) but the feedback path was never connected. Context assembly was intentionally read-only (`mutate=False`) but this broke the loop.
 - **Lesson:** Feedback loops require explicit wiring. "Read-only by default" is safe but can silently break downstream systems that depend on mutation side-effects. The decay/reinforcement balance must be tested end-to-end, not just each component in isolation.
+
+### DJ-008 [consolidation] D-016 amended — 2-search confirmation replaces single-search auto-displace
+
+- **Was:** Single grounded search → HIGH confidence → auto-displace loser (beta += 5.0)
+- **Now:** 1st search creates research_finding → 24h later 2nd search with rephrased prompt → displace only if both agree with MEDIUM+ structural confidence
+- **Why:** Gemini 3 has no API confidence scores (must self-assess, unreliable). beta += 5.0 is irreversible (memory can never recover). Context-dependent facts flattened by web search. Wrong verdict permanently kills correct memory. Structural confidence from grounding_chunk_count (0=UNRESOLVED, 1=LOW, 2+=MEDIUM) is safer than LLM self-assessment. Also: skip research for `source_tag='external_user'` (trust user over Google).
+- **Lesson:** In irreversible systems, require independent confirmation before destructive actions. Single-source verdicts are insufficient when the source has no calibrated confidence.
 
 <!--
 RULES:

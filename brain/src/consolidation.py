@@ -12,13 +12,24 @@ import logging
 import math
 import random
 import time
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
 import asyncpg
+import hdbscan
 import numpy as np
 
 from .activation import cosine_similarity
-from .llm import retry_llm_call
+from .config import NOVELTY_THRESHOLD, WEIGHT_CENTER_SQL
+from .db import get_agent_ids
+from .config import (
+    RESEARCH_CONFIRMATION_HOURS,
+    RESEARCH_DAILY_LIMIT,
+    RESEARCH_DISPLACE_BETA,
+    RESEARCH_HOURLY_LIMIT,
+    RESEARCH_MIN_WEIGHT,
+)
+from .llm import retry_llm_call, retry_llm_call_with_search
 from .memory import MemoryStore
 
 logger = logging.getLogger("brain.consolidation")
@@ -26,7 +37,7 @@ logger = logging.getLogger("brain.consolidation")
 # -- Tier 1 Constants --
 DECAY_TICK_INTERVAL = 3600  # 1 hour
 CONTRADICTION_SCAN_INTERVAL = 600  # 10 min
-PATTERN_DETECT_INTERVAL = 900  # 15 min
+PATTERN_DETECT_INTERVAL = 86400  # 1/day (D-021: HDBSCAN replaces greedy, runs daily)
 CONSTANT_LOOP_INTERVAL = 30  # main loop sleep
 DECAY_NUDGE_AMOUNT = 0.01
 DECAY_STALE_HOURS = 24
@@ -34,7 +45,7 @@ DECAY_STALE_HOURS = 24
 # -- Tier 2 Constants --
 DEEP_INTERVAL_SECONDS = 3600  # 1 hour
 DEEP_CHECK_INTERVAL = 60  # check triggers every 60s
-MERGE_SIMILARITY_THRESHOLD = 0.85
+MERGE_SIMILARITY_THRESHOLD = NOVELTY_THRESHOLD
 INSIGHT_QUESTION_COUNT = 3
 INSIGHT_PER_QUESTION = 5
 PROMOTE_GOAL_MIN_COUNT = 5
@@ -47,14 +58,14 @@ DECAY_STALE_DAYS = 90
 DECAY_MIN_ACCESS = 3
 DECAY_CONTRADICT_AMOUNT = 1.0
 
+# -- HDBSCAN Pattern Detection (D-021) --
+HDBSCAN_MIN_CLUSTER_SIZE = 3
+HDBSCAN_MIN_SAMPLES = 2
+PATTERN_MIN_WEIGHT = 0.25
+PATTERN_MIN_ACCESS = 2
+
 
 # -- Helpers --
-
-
-async def _get_agent_ids(pool: asyncpg.Pool) -> list[str]:
-    """Get all distinct agent IDs that have memories."""
-    rows = await pool.fetch("SELECT DISTINCT agent_id FROM memories")
-    return [r["agent_id"] for r in rows]
 
 
 async def _log_consolidation(
@@ -111,6 +122,38 @@ def _greedy_cluster(
     return clusters
 
 
+def _hdbscan_cluster(
+    items: list[tuple[str, np.ndarray]],
+    min_cluster_size: int = HDBSCAN_MIN_CLUSTER_SIZE,
+    min_samples: int = HDBSCAN_MIN_SAMPLES,
+) -> list[list[str]]:
+    """HDBSCAN clustering on embedding vectors (D-021).
+
+    Returns list of clusters (each cluster is a list of memory IDs).
+    Noise points (label=-1) are excluded.
+    """
+    if len(items) < min_cluster_size:
+        return []
+
+    ids = [item[0] for item in items]
+    embeddings = np.vstack([item[1] for item in items])
+
+    clusterer = hdbscan.HDBSCAN(
+        min_cluster_size=min_cluster_size,
+        min_samples=min_samples,
+        metric="euclidean",
+    )
+    labels = clusterer.fit_predict(embeddings)
+
+    # Group by label, exclude noise (-1)
+    groups: dict[int, list[str]] = defaultdict(list)
+    for idx, label in enumerate(labels):
+        if label >= 0:
+            groups[label].append(ids[idx])
+
+    return list(groups.values())
+
+
 # ==================================================================
 # Tier 1: Constant Consolidation
 # ==================================================================
@@ -119,9 +162,10 @@ def _greedy_cluster(
 class ConstantConsolidation:
     """Lightweight scheduled operations running every 30 seconds."""
 
-    def __init__(self, pool: asyncpg.Pool, memory_store: MemoryStore):
+    def __init__(self, pool: asyncpg.Pool, memory_store: MemoryStore, notification_store=None):
         self.pool = pool
         self.store = memory_store
+        self.notification_store = notification_store
         self._last_decay_tick: float = 0.0
         self._last_contradiction_scan: float = 0.0
         self._last_pattern_detect: float = 0.0
@@ -131,7 +175,7 @@ class ConstantConsolidation:
         logger.info("Tier 1 (constant) consolidation started.")
         while not shutdown_event.is_set():
             try:
-                agent_ids = await _get_agent_ids(self.pool)
+                agent_ids = await get_agent_ids(self.pool)
                 now = time.time()
 
                 for agent_id in agent_ids:
@@ -180,14 +224,14 @@ class ConstantConsolidation:
         """Nudge beta +0.01 for stale memories (24h+ not accessed)."""
         cutoff = datetime.now(timezone.utc) - timedelta(hours=DECAY_STALE_HOURS)
         result = await self.pool.execute(
-            """
+            f"""
             UPDATE memories
             SET depth_weight_beta = depth_weight_beta + $1,
                 updated_at = NOW()
             WHERE agent_id = $2
               AND (last_accessed IS NULL OR last_accessed < $3)
               AND NOT immutable
-              AND depth_weight_alpha / (depth_weight_alpha + depth_weight_beta) > 0.1
+              AND {WEIGHT_CENTER_SQL} > 0.1
             """,
             DECAY_NUDGE_AMOUNT,
             agent_id,
@@ -270,6 +314,18 @@ class ConstantConsolidation:
                         mem_a["id"],
                         mem_b["id"],
                     )
+                    # D-019: Notify about contradiction
+                    if self.notification_store:
+                        try:
+                            await self.notification_store.enqueue(
+                                agent_id=agent_id,
+                                content=f"Contradiction detected: {response[:200]}",
+                                urgency=0.3,
+                                importance=0.6,
+                                source="consolidation/contradiction",
+                            )
+                        except Exception:
+                            pass
             except Exception as e:
                 logger.warning("Contradiction check failed for pair: %s", e)
 
@@ -279,58 +335,479 @@ class ConstantConsolidation:
             "contradiction_scan",
             {"pairs_checked": len(pairs), "tensions_found": tensions_found},
         )
+
+        # D-016: Queue research for factual contradictions + process queue
+        for mem_a, mem_b in pairs:
+            await self._maybe_queue_research(agent_id, mem_a, mem_b)
+        await self._process_research_queue(agent_id)
+
         return {"status": "ok", "pairs_checked": len(pairs), "tensions_found": tensions_found}
+
+    # -- Research sessions (D-016/DJ-008) --
+
+    async def _maybe_queue_research(
+        self, agent_id: str, mem_a: dict, mem_b: dict,
+    ) -> None:
+        """Classify a contradiction and queue for research if factual + high confidence."""
+        try:
+            # Check weight centers — skip if both < RESEARCH_MIN_WEIGHT
+            centers = await self.pool.fetch(
+                f"""
+                SELECT id, {WEIGHT_CENTER_SQL} AS center, source_tag
+                FROM memories WHERE id = ANY($1) AND agent_id = $2
+                """,
+                [mem_a["id"], mem_b["id"]],
+                agent_id,
+            )
+            center_map = {r["id"]: r for r in centers}
+            ca = center_map.get(mem_a["id"])
+            cb = center_map.get(mem_b["id"])
+            if not ca or not cb:
+                return
+            if float(ca["center"]) < RESEARCH_MIN_WEIGHT and float(cb["center"]) < RESEARCH_MIN_WEIGHT:
+                return
+            # Skip user-sourced memories (trust user over Google)
+            if ca.get("source_tag") == "external_user" or cb.get("source_tag") == "external_user":
+                return
+            # Rate limit check
+            if not await self._check_research_rate_limits(agent_id):
+                return
+            # Classify
+            classification = await self._classify_contradiction(mem_a, mem_b)
+            if (
+                classification.get("type") == "factual"
+                and classification.get("confidence", 0) > 0.7
+                and classification.get("research_worthy")
+            ):
+                await self.pool.execute(
+                    """
+                    INSERT INTO research_queue
+                        (agent_id, tension_id, mem_a_id, mem_b_id, classification)
+                    VALUES ($1, $2, $3, $4, $5)
+                    """,
+                    agent_id,
+                    "",  # tension_id filled later if needed
+                    mem_a["id"],
+                    mem_b["id"],
+                    classification,
+                )
+                logger.info("Research queued for %s vs %s [%s]", mem_a["id"], mem_b["id"], agent_id)
+        except Exception as e:
+            logger.warning("Research queue failed: %s", e)
+
+    async def _classify_contradiction(self, mem_a: dict, mem_b: dict) -> dict:
+        """LLM classifies contradiction as factual/subjective with confidence."""
+        prompt = (
+            "Two memories contradict each other:\n"
+            f'A: "{mem_a["content"][:500]}"\n'
+            f'B: "{mem_b["content"][:500]}"\n\n'
+            "Classify: Is this a factual contradiction or a subjective difference?\n"
+            "Rate confidence 0.0-1.0. Is web research appropriate to resolve this?\n"
+            'Respond as JSON only: {"type": "factual" or "subjective", '
+            '"confidence": 0.0-1.0, "research_worthy": true/false, '
+            '"research_question": "what to search for"}'
+        )
+        import json
+        try:
+            response = await retry_llm_call(prompt, temperature=0.2)
+            # Try to extract JSON from response
+            text = response.strip()
+            if text.startswith("```"):
+                text = text.split("```")[1]
+                if text.startswith("json"):
+                    text = text[4:]
+            return json.loads(text)
+        except (json.JSONDecodeError, RuntimeError) as e:
+            logger.warning("Classification parse failed: %s", e)
+            return {"type": "unknown", "confidence": 0.0, "research_worthy": False, "research_question": ""}
+
+    async def _check_research_rate_limits(self, agent_id: str) -> bool:
+        """Check 1/hour and 24/day limits. Returns True if allowed."""
+        row = await self.pool.fetchrow(
+            """
+            SELECT
+                COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '1 hour') AS hourly,
+                COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '24 hours') AS daily
+            FROM consolidation_log
+            WHERE agent_id = $1 AND operation = 'research_session'
+            """,
+            agent_id,
+        )
+        return row["hourly"] < RESEARCH_HOURLY_LIMIT and row["daily"] < RESEARCH_DAILY_LIMIT
+
+    async def _process_research_queue(self, agent_id: str) -> None:
+        """Process pending and awaiting-confirmation research items."""
+        try:
+            # 1. Run first research on pending items
+            pending = await self.pool.fetch(
+                "SELECT * FROM research_queue WHERE agent_id = $1 AND status = 'pending' LIMIT 1",
+                agent_id,
+            )
+            for item in pending:
+                await self._run_first_research(agent_id, item)
+
+            # 2. Run confirmation on items researched 24h+ ago
+            awaiting = await self.pool.fetch(
+                """
+                SELECT * FROM research_queue
+                WHERE agent_id = $1
+                  AND status = 'researched'
+                  AND first_researched_at < NOW() - INTERVAL '%d hours'
+                LIMIT 1
+                """ % RESEARCH_CONFIRMATION_HOURS,
+                agent_id,
+            )
+            for item in awaiting:
+                await self._run_confirmation_research(agent_id, item)
+        except Exception as e:
+            logger.warning("Research queue processing failed: %s", e)
+
+    async def _run_first_research(self, agent_id: str, item: dict) -> None:
+        """Execute first search for a queued contradiction."""
+        classification = item["classification"]
+        question = classification.get("research_question", "")
+        if not question:
+            await self.pool.execute(
+                "UPDATE research_queue SET status = 'expired' WHERE id = $1", item["id"],
+            )
+            return
+
+        prompt = (
+            f"Research this factual question using web search:\n{question}\n\n"
+            "Provide a clear, factual answer based on search results. "
+            "State which of the following is correct:\n"
+            f'A: "{(await self.pool.fetchval("SELECT content FROM memories WHERE id=$1", item["mem_a_id"]) or "")[:300]}"\n'
+            f'B: "{(await self.pool.fetchval("SELECT content FROM memories WHERE id=$1", item["mem_b_id"]) or "")[:300]}"\n\n'
+            'Respond with: {"verdict": "A" or "B" or "neither", '
+            '"explanation": "brief explanation", "confidence": "HIGH/MEDIUM/LOW"}'
+        )
+        try:
+            text, sources, chunk_count = await retry_llm_call_with_search(prompt)
+        except RuntimeError:
+            logger.warning("First research LLM failed for queue item %d", item["id"])
+            return
+
+        # Structural confidence from grounding chunks
+        if chunk_count == 0:
+            struct_confidence = "UNRESOLVED"
+        elif chunk_count == 1:
+            struct_confidence = "LOW"
+        else:
+            struct_confidence = "MEDIUM"
+
+        result = {
+            "text": text[:1000],
+            "sources": sources[:5],
+            "grounding_chunk_count": chunk_count,
+            "structural_confidence": struct_confidence,
+        }
+
+        # Store research finding memory
+        await self.store.store_memory(
+            content=f"Research finding: {text[:500]}",
+            agent_id=agent_id,
+            memory_type="research_finding",
+            source="consolidation",
+            source_tag="consolidation_research",
+            importance=0.6,
+            metadata={
+                "research_question": question,
+                "sources": sources[:5],
+                "structural_confidence": struct_confidence,
+                "queue_id": item["id"],
+            },
+        )
+
+        await self.pool.execute(
+            """
+            UPDATE research_queue
+            SET status = 'researched', first_result = $1, first_researched_at = NOW()
+            WHERE id = $2
+            """,
+            result, item["id"],
+        )
+        await _log_consolidation(self.pool, agent_id, "research_session", {
+            "queue_id": item["id"],
+            "phase": "first",
+            "structural_confidence": struct_confidence,
+        })
+        logger.info("First research complete for queue %d [%s]: %s", item["id"], agent_id, struct_confidence)
+        # D-019: Notify on MEDIUM confidence research findings
+        if struct_confidence == "MEDIUM" and self.notification_store:
+            try:
+                await self.notification_store.enqueue(
+                    agent_id=agent_id,
+                    content=f"Research finding ({struct_confidence}): {text[:200]}",
+                    urgency=0.5,
+                    importance=0.8,
+                    source="consolidation/research",
+                    source_memory_id=item["mem_a_id"],
+                )
+            except Exception:
+                pass
+
+    async def _run_confirmation_research(self, agent_id: str, item: dict) -> None:
+        """Execute second (confirmation) search with rephrased prompt."""
+        first = item["first_result"] or {}
+        classification = item["classification"]
+        question = classification.get("research_question", "")
+
+        # Rephrase for independent verification
+        prompt = (
+            f"Verify this factual claim by searching the web:\n"
+            f"Original question: {question}\n"
+            f"Previous finding: {first.get('text', '')[:300]}\n\n"
+            "Search independently to confirm or refute the previous finding. "
+            'Respond with: {"verdict": "confirmed" or "refuted" or "inconclusive", '
+            '"explanation": "brief explanation"}'
+        )
+        try:
+            text, sources, chunk_count = await retry_llm_call_with_search(prompt)
+        except RuntimeError:
+            logger.warning("Confirmation research failed for queue %d", item["id"])
+            return
+
+        struct_confidence = "UNRESOLVED" if chunk_count == 0 else ("LOW" if chunk_count == 1 else "MEDIUM")
+        result = {
+            "text": text[:1000],
+            "sources": sources[:5],
+            "grounding_chunk_count": chunk_count,
+            "structural_confidence": struct_confidence,
+        }
+
+        import json
+        # Check if both searches agree
+        try:
+            verdict_text = text.strip()
+            if verdict_text.startswith("```"):
+                verdict_text = verdict_text.split("```")[1]
+                if verdict_text.startswith("json"):
+                    verdict_text = verdict_text[4:]
+            verdict = json.loads(verdict_text)
+        except (json.JSONDecodeError, IndexError):
+            verdict = {"verdict": "inconclusive"}
+
+        if verdict.get("verdict") == "confirmed" and struct_confidence == "MEDIUM":
+            # Both searches agree — displace the loser via safety
+            first_text = first.get("text", "")
+            # Determine which memory to displace from first result
+            import re
+            loser_id = None
+            if '"verdict": "A"' in first_text or '"verdict":"A"' in first_text:
+                loser_id = item["mem_b_id"]
+            elif '"verdict": "B"' in first_text or '"verdict":"B"' in first_text:
+                loser_id = item["mem_a_id"]
+
+            if loser_id:
+                # Displace through safety-checked weight change
+                if self.store.safety:
+                    allowed, adj_alpha, adj_beta, reasons = self.store.safety.check_weight_change(
+                        0.0, 0.0, RESEARCH_DISPLACE_BETA, 0.0, 0.0,
+                    )
+                    if allowed:
+                        await self.pool.execute(
+                            "UPDATE memories SET depth_weight_beta = depth_weight_beta + $1 WHERE id = $2",
+                            adj_beta, loser_id,
+                        )
+                        logger.info("Research displaced memory %s (beta += %.1f)", loser_id, adj_beta)
+                else:
+                    await self.pool.execute(
+                        "UPDATE memories SET depth_weight_beta = depth_weight_beta + $1 WHERE id = $2",
+                        RESEARCH_DISPLACE_BETA, loser_id,
+                    )
+
+                # Create correction memory
+                await self.store.store_memory(
+                    content=f"Verified correction: {first.get('text', '')[:300]}",
+                    agent_id=agent_id,
+                    memory_type="correction",
+                    source="consolidation",
+                    source_tag="consolidation_research",
+                    importance=0.8,
+                    metadata={
+                        "displaced_memory_id": loser_id,
+                        "research_sources": (first.get("sources", []) + sources)[:5],
+                        "queue_id": item["id"],
+                    },
+                )
+            # D-019: Notify about confirmed research displacement
+            if self.notification_store and loser_id:
+                try:
+                    await self.notification_store.enqueue(
+                        agent_id=agent_id,
+                        content=f"Research confirmed: displaced memory {loser_id}",
+                        urgency=0.5,
+                        importance=0.8,
+                        source="consolidation/research_confirmed",
+                        source_memory_id=loser_id,
+                    )
+                except Exception:
+                    pass
+            status = "confirmed"
+        else:
+            status = "expired"
+
+        await self.pool.execute(
+            "UPDATE research_queue SET status = $1, second_result = $2, second_researched_at = NOW() WHERE id = $3",
+            status, result, item["id"],
+        )
+        await _log_consolidation(self.pool, agent_id, "research_session", {
+            "queue_id": item["id"],
+            "phase": "confirmation",
+            "outcome": status,
+        })
+        logger.info("Confirmation research for queue %d [%s]: %s", item["id"], agent_id, status)
 
     # -- Pattern detection --
 
     async def _pattern_detection(self, agent_id: str) -> dict:
-        """Greedy cluster recent memories by embedding similarity."""
+        """HDBSCAN cluster qualifying memories, generate per-cluster insights (D-021)."""
         rows = await self.pool.fetch(
-            """
-            SELECT id, content, embedding::float4[] AS embedding_arr
+            f"""
+            SELECT id, content, type, embedding::float4[] AS embedding_arr,
+                   {WEIGHT_CENTER_SQL} AS center
             FROM memories
             WHERE agent_id = $1
-              AND created_at > NOW() - INTERVAL '7 days'
               AND embedding IS NOT NULL
-            ORDER BY created_at DESC LIMIT 50
+              AND {WEIGHT_CENTER_SQL} > $2
+              AND access_count >= $3
+              AND COALESCE(insight_level, 0) < 2
+            ORDER BY created_at DESC LIMIT 200
             """,
             agent_id,
+            PATTERN_MIN_WEIGHT,
+            PATTERN_MIN_ACCESS,
         )
-        if len(rows) < 3:
-            return {"status": "ok", "clusters_found": 0}
+        if len(rows) < HDBSCAN_MIN_CLUSTER_SIZE:
+            return {"status": "ok", "clusters_found": 0, "insights_created": 0}
 
         items = [
             (r["id"], np.array(r["embedding_arr"], dtype=np.float32))
             for r in rows
         ]
-        clusters = _greedy_cluster(items, MERGE_SIMILARITY_THRESHOLD)
+        clusters = _hdbscan_cluster(items)
 
-        significant = [c for c in clusters if len(c) >= 3]
+        significant = [c for c in clusters if len(c) >= HDBSCAN_MIN_CLUSTER_SIZE]
+        if not significant:
+            return {"status": "ok", "clusters_found": 0, "insights_created": 0}
+
+        # Build id→row lookup
+        row_map = {r["id"]: r for r in rows}
+        cluster_insights: list[dict] = []
+        insights_created = 0
+
+        # Per-cluster LLM analysis
         for cluster_ids in significant:
-            # Find representative content
-            rep_content = ""
-            for r in rows:
-                if r["id"] == cluster_ids[0]:
-                    rep_content = r["content"][:200]
-                    break
+            cluster_rows = [row_map[cid] for cid in cluster_ids if cid in row_map]
+            if not cluster_rows:
+                continue
+
+            contents = "\n".join(
+                f"- [{r['type']}] {r['content'][:300]}" for r in cluster_rows
+            )
+            prompt = (
+                f"Analyze these {len(cluster_rows)} related memories and extract "
+                f"the key pattern or insight:\n{contents}\n\n"
+                "Write a single, first-person insight (1-2 sentences) that "
+                "captures what this cluster reveals about my experience or beliefs."
+            )
+            try:
+                insight_text = await retry_llm_call(prompt, temperature=0.4)
+            except RuntimeError:
+                logger.warning("LLM failed for cluster analysis [%s]", agent_id)
+                continue
+
+            if not insight_text or len(insight_text) < 20:
+                continue
+
+            # Dedup check
+            is_novel, sim, existing_id = await self.store.check_novelty(
+                insight_text, agent_id, MERGE_SIMILARITY_THRESHOLD,
+            )
+            if not is_novel and existing_id:
+                await self.store.apply_retrieval_mutation([existing_id], agent_id)
+                logger.debug("Pattern insight reinforced existing %s", existing_id)
+                continue
+
+            # Store as level-1 insight
+            mem_id = await self.store.store_insight(
+                content=insight_text,
+                agent_id=agent_id,
+                source_memory_ids=cluster_ids,
+                importance=0.8,
+                metadata={"phase": "hdbscan_pattern", "cluster_size": len(cluster_ids)},
+                insight_level=1,
+            )
+            insights_created += 1
+            cluster_insights.append({
+                "content": insight_text,
+                "cluster_size": len(cluster_ids),
+                "source_ids": cluster_ids,
+                "insight_id": mem_id,
+            })
+
             await _log_consolidation(
                 self.pool,
                 agent_id,
-                "pattern_detected",
+                "pattern_insight",
                 {
                     "cluster_size": len(cluster_ids),
                     "member_ids": cluster_ids,
-                    "representative": rep_content,
+                    "insight_id": mem_id,
+                    "insight": insight_text[:200],
                 },
             )
 
-        if significant:
-            logger.info(
-                "Pattern detection [%s]: %d clusters (3+ members)",
-                agent_id,
-                len(significant),
+        # Cross-cluster meta-insight (1-level recursion: D-021)
+        if len(cluster_insights) >= 2:
+            insights_text = "\n".join(
+                f"- (cluster of {ci['cluster_size']}): {ci['content'][:200]}"
+                for ci in cluster_insights
             )
-        return {"status": "ok", "clusters_found": len(significant)}
+            meta_prompt = (
+                f"These are insights extracted from {len(cluster_insights)} "
+                f"memory clusters:\n{insights_text}\n\n"
+                "Write a single meta-level observation (1-2 sentences) about what "
+                "these patterns collectively reveal about my experience."
+            )
+            try:
+                meta_text = await retry_llm_call(meta_prompt, temperature=0.4)
+            except RuntimeError:
+                meta_text = None
+
+            if meta_text and len(meta_text) >= 20:
+                is_novel, sim, existing_id = await self.store.check_novelty(
+                    meta_text, agent_id, MERGE_SIMILARITY_THRESHOLD,
+                )
+                if is_novel:
+                    all_source_ids = [
+                        ci["insight_id"] for ci in cluster_insights
+                    ]
+                    meta_id = await self.store.store_insight(
+                        content=meta_text,
+                        agent_id=agent_id,
+                        source_memory_ids=all_source_ids,
+                        importance=0.9,
+                        metadata={"phase": "hdbscan_meta", "source_insights": len(cluster_insights)},
+                        insight_level=2,
+                    )
+                    insights_created += 1
+                    await _log_consolidation(
+                        self.pool,
+                        agent_id,
+                        "meta_insight",
+                        {"insight_id": meta_id, "meta_insight": meta_text[:200]},
+                    )
+
+        logger.info(
+            "Pattern detection [%s]: %d HDBSCAN clusters, %d insights created",
+            agent_id, len(significant), insights_created,
+        )
+        return {
+            "status": "ok",
+            "clusters_found": len(significant),
+            "insights_created": insights_created,
+        }
 
 
 # ==================================================================
@@ -341,9 +818,10 @@ class ConstantConsolidation:
 class DeepConsolidation:
     """Hourly deep processing cycle, or triggered manually."""
 
-    def __init__(self, pool: asyncpg.Pool, memory_store: MemoryStore):
+    def __init__(self, pool: asyncpg.Pool, memory_store: MemoryStore, notification_store=None):
         self.pool = pool
         self.store = memory_store
+        self.notification_store = notification_store
         self._last_deep: float = 0.0
         self._trigger_agents: set[str] = set()
         self._running: bool = False
@@ -369,7 +847,7 @@ class DeepConsolidation:
 
                 # Check for hourly schedule
                 elif now - self._last_deep >= DEEP_INTERVAL_SECONDS:
-                    agent_ids = await _get_agent_ids(self.pool)
+                    agent_ids = await get_agent_ids(self.pool)
                     for agent_id in agent_ids:
                         await self._safe_deep_cycle(agent_id)
                     self._last_deep = now
@@ -651,15 +1129,15 @@ class DeepConsolidation:
 
         # Goal promotion: 5+ access, 14+ days old, center < 0.65
         goal_candidates = await self.pool.fetch(
-            """
+            f"""
             SELECT id, content, access_count,
                    depth_weight_alpha, depth_weight_beta,
-                   depth_weight_alpha / (depth_weight_alpha + depth_weight_beta) AS center
+                   {WEIGHT_CENTER_SQL} AS center
             FROM memories
             WHERE agent_id = $1
               AND access_count >= $2
               AND created_at < NOW() - INTERVAL '1 day' * $3
-              AND depth_weight_alpha / (depth_weight_alpha + depth_weight_beta) < 0.65
+              AND {WEIGHT_CENTER_SQL} < 0.65
               AND NOT immutable
             """,
             agent_id,
@@ -695,15 +1173,15 @@ class DeepConsolidation:
 
         # Identity promotion: 10+ access, 30+ days, center 0.65-0.82
         identity_candidates = await self.pool.fetch(
-            """
+            f"""
             SELECT id, content, access_count,
                    depth_weight_alpha, depth_weight_beta,
-                   depth_weight_alpha / (depth_weight_alpha + depth_weight_beta) AS center
+                   {WEIGHT_CENTER_SQL} AS center
             FROM memories
             WHERE agent_id = $1
               AND access_count >= $2
               AND created_at < NOW() - INTERVAL '1 day' * $3
-              AND depth_weight_alpha / (depth_weight_alpha + depth_weight_beta) BETWEEN 0.65 AND 0.82
+              AND {WEIGHT_CENTER_SQL} BETWEEN 0.65 AND 0.82
               AND NOT immutable
             """,
             agent_id,
@@ -915,8 +1393,8 @@ class DeepConsolidation:
     async def _tune_parameters(self, agent_id: str) -> dict:
         """Entropy check on weight distribution (log only, Phase 7 adds enforcement)."""
         rows = await self.pool.fetch(
-            """
-            SELECT depth_weight_alpha / (depth_weight_alpha + depth_weight_beta) AS center
+            f"""
+            SELECT {WEIGHT_CENTER_SQL} AS center
             FROM memories
             WHERE agent_id = $1 AND NOT immutable
             """,
@@ -1046,9 +1524,9 @@ class DeepConsolidation:
 class ConsolidationEngine:
     """Runs Tier 1 (constant) and Tier 2 (deep) consolidation as background tasks."""
 
-    def __init__(self, pool: asyncpg.Pool, memory_store: MemoryStore):
-        self.constant = ConstantConsolidation(pool, memory_store)
-        self.deep = DeepConsolidation(pool, memory_store)
+    def __init__(self, pool: asyncpg.Pool, memory_store: MemoryStore, notification_store=None):
+        self.constant = ConstantConsolidation(pool, memory_store, notification_store)
+        self.deep = DeepConsolidation(pool, memory_store, notification_store)
         self._running: bool = False
 
     async def run(self, shutdown_event: asyncio.Event) -> None:

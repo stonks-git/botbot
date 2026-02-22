@@ -1,5 +1,5 @@
 # PLAN: Identity Architecture Rework + Sustainability Fixes
-Status: active
+Status: done
 Parent: none
 Supersedes: none
 Roadmap task: D-015, D-017, D-018a, D-018b, D-018c, D-018d
@@ -77,28 +77,52 @@ Depends on: Phase 1 (scoring must exist before logging it)
   Do: Add Pydantic models `InjectionMetricsResponse` with fields: `total_logs: int`, `injection_rate: float` (was_injected=true / total), `score_stats: dict` (avg, p50, p75, p95 of injection_score), `top_memories: list[dict]` (top 10 memory_id by was_injected=true count, with count + avg_score). Add endpoint `GET /injection/metrics?agent_id=X&days=7`. SQL: use `percentile_cont(array[0.5, 0.75, 0.95]) WITHIN GROUP (ORDER BY injection_score)` for percentiles. Top memories: `GROUP BY memory_id` where `was_injected = true`, `ORDER BY count DESC LIMIT 10`. Return empty/zero stats on empty table (no crash). Time-filter by `created_at >= NOW() - ($days || ' days')::interval`.
   Verify: Call `/context/assemble` 5+ times with varying queries, then `GET /injection/metrics` — stats populated with non-zero values. Call on fresh agent with no logs — returns zeros, no error.
 
-## Phase 3: Semantic chunking + memory groups (D-018b, D-018c)
+## Phase 3: Semantic chunking + memory groups (D-018b, D-018c) — DONE
 
 Structural changes to how memories are stored and maintained.
 
 Intent: Enforce 300-token max at gate time via semantic chunking. Add `memory_group_id` column for linking chunks. Group-wide beta refresh (touching one chunk in a group refreshes all). Insights from a single group share group_id.
 
-**Key files:** `brain/src/schema.sql`, `brain/src/gate.py`, `brain/src/memory.py`, `brain/src/consolidation.py`
+**Key files:** `brain/src/schema.sql`, `brain/src/gate.py`, `brain/src/memory.py`, `brain/src/context_assembly.py`
 **Key decisions:** D-018b, D-018c
 
-Tasks: (empty until decomposition session)
 Depends on: Phase 2 (logging should be in place to observe impact)
 
-## Phase 4: Adaptive context shift threshold (D-018a)
+- [x] **3.1: Add `memory_group_id` column + MemoryStore parameter**
+  Files: `brain/src/schema.sql`, `brain/src/memory.py`
+  Do: Add `memory_group_id TEXT` column to memories table (nullable, NULL = standalone memory). Add index `idx_memories_group ON memories (memory_group_id) WHERE memory_group_id IS NOT NULL` (partial — no point indexing NULLs). In `store_memory()`, add optional `memory_group_id: str | None = None` parameter. Pass it to the INSERT statement. No behavioral change for existing callers (default None).
+  Verify: SQL parses. `store_memory(content, agent_id, memory_group_id="grp_123")` stores memory with group_id. `store_memory(content, agent_id)` stores memory with NULL group_id. Existing tests/callers unaffected.
+
+- [x] **3.2: Semantic chunking function + gate integration**
+  Files: `brain/src/gate.py`, `brain/src/api.py`
+  Do: Add `semantic_chunk(text: str, max_tokens: int = 300) -> list[str]` function in gate.py. Algorithm: split by `\n\n` (paragraphs) first, then by sentence boundaries (`. `, `! `, `? `). Greedily merge segments into chunks, each ≤ max_tokens (use `len(text) // 4` estimate same as context_assembly). If a single sentence > max_tokens, keep it as its own chunk (don't split mid-sentence). In api.py `gate_memory()`, when decision is PERSIST/PERSIST_HIGH/PERSIST_FLAG: check `_estimate_tokens(req.content) > 300`. If over: call `semantic_chunk(req.content)`, generate a `group_id = MemoryStore._gen_id("grp")`, store each chunk as a separate memory with shared `memory_group_id=group_id` and metadata `{"group_part": N, "group_total": M, "gate_decision": decision, "gate_score": score}`. Return `memory_id` as the first chunk's ID. Single-memory path unchanged (no group_id).
+  Verify: POST `/memory/gate` with content > 300 tokens → multiple memories created with shared group_id. POST with short content → single memory, no group_id. Each chunk ≤ 300 tokens. `semantic_chunk("short text")` returns `["short text"]`.
+
+- [x] **3.3: Group-wide touch_memory**
+  Files: `brain/src/memory.py`
+  Do: In `touch_memory()`, after the existing single-memory UPDATE, add: query the touched memory's `memory_group_id`. If not NULL, UPDATE `last_accessed` and `updated_at` on all memories with the same `memory_group_id` and `agent_id` (single SQL: `UPDATE memories SET last_accessed=$1, updated_at=$1 WHERE memory_group_id=$2 AND agent_id=$3 AND NOT immutable`). This refreshes all group siblings, preventing decay for the whole group when any member is accessed. The group UPDATE is a superset of the original single-row UPDATE, so the original UPDATE handles the standalone (NULL group_id) case and the group UPDATE handles groups.
+  Verify: Create 3 memories with shared group_id. Touch one → all 3 have updated `last_accessed`. Touch a standalone memory (no group_id) → only that memory updated.
+
+- [x] **3.4: Insight group_id inheritance + context annotation**
+  Files: `brain/src/memory.py`, `brain/src/context_assembly.py`
+  Do: In `store_insight()`, after computing inherited weights: query source memories' `memory_group_id` values. If ALL sources share the same non-NULL group_id, pass that group_id to `store_memory(memory_group_id=shared_group_id)`. Otherwise pass None. In `context_assembly.py`'s `assemble_context()`, when building identity_memories and situational parts: for memories with metadata `group_part` and `group_total`, prepend `[part N of M]` to content string before adding to parts list. This requires fetching metadata alongside content — update the identity scoring query in `score_identity_wxs()` to include `metadata` column, and the hybrid search already returns full rows.
+  Verify: Create insight from sources that all share group_id="grp_abc" → insight has group_id="grp_abc". Create insight from mixed sources → insight has NULL group_id. Context assembly renders chunked memories with `[part 1 of 3]` prefix.
+
+## Phase 4: Adaptive context shift threshold (D-018a) — DONE
 
 Self-evolving threshold that replaces the hardcoded 0.7.
 
 Intent: P75 percentile of last 200 context shift values stored in a ring buffer. Active identity cached between subject changes. Threshold adapts to the agent's actual injection score distribution.
 
-**Key files:** `brain/src/context_assembly.py`
+**Key files:** `brain/src/schema.sql`, `brain/src/context_assembly.py`
 **Key decision:** D-018a
 
-Tasks: (empty until decomposition session)
+Implemented in Session 29 (T-P15) via Claude Code plan mode plan (harmonic-jumping-kurzweil.md):
+- [x] context_shift_buffer table + ring buffer (200 rows)
+- [x] _record_context_shift + _get_adaptive_threshold (P75 percentile)
+- [x] Module-level identity cache with threshold-gated invalidation
+- [x] Replaced hardcoded 0.7 with adaptive threshold for inertia decision
+
 Depends on: Phase 2 (needs injection_logs data to compute meaningful percentiles)
 
 ---

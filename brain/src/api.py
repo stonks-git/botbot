@@ -9,14 +9,16 @@ import numpy as np
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
+from .config import NOTIFICATION_MAX_PASSIVE_PER_CONTEXT, WEIGHT_CENTER_SQL
 from .consolidation import ConsolidationEngine
 from .context_assembly import assemble_context, render_identity_full, render_identity_hash, render_system_prompt
 from .db import close_pool, get_pool, init_pool
 from .dmn_store import ThoughtQueue
-from .gate import DROP, BUFFER, PERSIST, PERSIST_FLAG, PERSIST_HIGH, REINFORCE, SKIP, EntryGate, ExitGate
+from .gate import DROP, BUFFER, PERSIST, PERSIST_FLAG, PERSIST_HIGH, REINFORCE, SKIP, EntryGate, ExitGate, semantic_chunk, _estimate_tokens as _gate_estimate_tokens
 from .gut import GutFeeling
 from .idle import IdleLoop
 from .memory import MemoryStore
+from .notification import NotificationStore, DeliveryWorker
 from .bootstrap import BootstrapReadiness
 from .safety import SafetyMonitor, get_audit_log
 
@@ -38,6 +40,9 @@ _thought_queue: ThoughtQueue | None = None
 _idle_shutdown: asyncio.Event | None = None
 _safety_monitor: SafetyMonitor | None = None
 _bootstrap: BootstrapReadiness | None = None
+_notification_store: NotificationStore | None = None
+_delivery_worker: DeliveryWorker | None = None
+_delivery_shutdown: asyncio.Event | None = None
 
 
 def _get_gut(agent_id: str) -> GutFeeling:
@@ -54,6 +59,7 @@ async def lifespan(app: FastAPI):
     global _consolidation_engine, _consolidation_shutdown
     global _idle_loop, _thought_queue, _idle_shutdown
     global _safety_monitor, _bootstrap
+    global _notification_store, _delivery_worker, _delivery_shutdown
     _start_time = time.time()
     pool = await init_pool()
     _memory_store = MemoryStore(pool)
@@ -62,10 +68,11 @@ async def lifespan(app: FastAPI):
     _entry_gate = EntryGate()
     _exit_gate = ExitGate()
     _bootstrap = BootstrapReadiness(pool)
+    _notification_store = NotificationStore(pool)
 
     # Start consolidation engine as background task
     _consolidation_shutdown = asyncio.Event()
-    _consolidation_engine = ConsolidationEngine(pool, _memory_store)
+    _consolidation_engine = ConsolidationEngine(pool, _memory_store, _notification_store)
     consolidation_task = asyncio.create_task(
         _consolidation_engine.run(_consolidation_shutdown)
     )
@@ -73,11 +80,25 @@ async def lifespan(app: FastAPI):
     # Start DMN idle loop as background task
     _thought_queue = ThoughtQueue()
     _idle_shutdown = asyncio.Event()
-    _idle_loop = IdleLoop(pool, _memory_store, _thought_queue, _get_gut)
+    _idle_loop = IdleLoop(pool, _memory_store, _thought_queue, _get_gut, _notification_store)
     idle_task = asyncio.create_task(_idle_loop.run(_idle_shutdown))
-    logger.info("Brain service started (consolidation + DMN active).")
+
+    # Start notification delivery worker
+    _delivery_shutdown = asyncio.Event()
+    _delivery_worker = DeliveryWorker(pool, _notification_store)
+    delivery_task = asyncio.create_task(_delivery_worker.run(_delivery_shutdown))
+    logger.info("Brain service started (consolidation + DMN + notifications active).")
 
     yield
+
+    # Shutdown notification delivery
+    if _delivery_shutdown:
+        _delivery_shutdown.set()
+    delivery_task.cancel()
+    try:
+        await delivery_task
+    except asyncio.CancelledError:
+        pass
 
     # Shutdown DMN
     if _idle_shutdown:
@@ -105,6 +126,8 @@ async def lifespan(app: FastAPI):
     _thought_queue = None
     _safety_monitor = None
     _bootstrap = None
+    _notification_store = None
+    _delivery_worker = None
     await close_pool()
     logger.info("Brain service stopped.")
 
@@ -126,14 +149,14 @@ async def _get_identity_embeddings(agent_id: str, top_n: int = 20):
     """
     store = _store()
     rows = await store.pool.fetch(
-        """
+        f"""
         SELECT content,
-               depth_weight_alpha / (depth_weight_alpha + depth_weight_beta) AS center,
+               {WEIGHT_CENTER_SQL} AS center,
                embedding::float4[] AS embedding_arr
         FROM memories
         WHERE agent_id = $1 AND embedding IS NOT NULL
-          AND depth_weight_alpha / (depth_weight_alpha + depth_weight_beta) > 0.3
-        ORDER BY depth_weight_alpha / (depth_weight_alpha + depth_weight_beta) DESC
+          AND {WEIGHT_CENTER_SQL} > 0.3
+        ORDER BY {WEIGHT_CENTER_SQL} DESC
         LIMIT $2
         """,
         agent_id,
@@ -490,17 +513,50 @@ async def gate_memory(req: GateRequest):
 
     # 4. Act on decision
     if decision in (PERSIST, PERSIST_HIGH, PERSIST_FLAG):
-        # Promote to long-term memory
+        # Promote to long-term memory (with semantic chunking for long content)
         try:
             importance = min(0.9, 0.5 + score * 0.4)
-            memory_id = await store.store_memory(
-                content=req.content,
-                agent_id=req.agent_id,
-                source=req.source,
-                source_tag=req.source_tag,
-                importance=importance,
-                metadata={"gate_decision": decision, "gate_score": score},
-            )
+            content_tokens = _gate_estimate_tokens(req.content)
+
+            if content_tokens > 300:
+                # D-018b: chunk long content, link via memory_group_id
+                chunks = semantic_chunk(req.content)
+                group_id = MemoryStore._gen_id("grp")
+                total = len(chunks)
+                first_id = None
+                for idx, chunk_text in enumerate(chunks, 1):
+                    chunk_meta = {
+                        "gate_decision": decision,
+                        "gate_score": score,
+                        "group_part": idx,
+                        "group_total": total,
+                    }
+                    mid = await store.store_memory(
+                        content=chunk_text,
+                        agent_id=req.agent_id,
+                        source=req.source,
+                        source_tag=req.source_tag,
+                        importance=importance,
+                        metadata=chunk_meta,
+                        memory_group_id=group_id,
+                    )
+                    if first_id is None:
+                        first_id = mid
+                memory_id = first_id
+                logger.info(
+                    "Chunked %d tokens into %d memories (group=%s) [%s]",
+                    content_tokens, total, group_id, req.agent_id,
+                )
+            else:
+                # Single memory, no group
+                memory_id = await store.store_memory(
+                    content=req.content,
+                    agent_id=req.agent_id,
+                    source=req.source,
+                    source_tag=req.source_tag,
+                    importance=importance,
+                    metadata={"gate_decision": decision, "gate_score": score},
+                )
             # Remove from scratch
             await store.pool.execute(
                 "DELETE FROM scratch_buffer WHERE id = $1 AND agent_id = $2",
@@ -580,12 +636,27 @@ async def context_assemble(req: ContextAssembleRequest):
     # Compute emotional delta
     gut.compute_delta(context=req.query_text[:100] if req.query_text else "")
 
+    # Build cognitive state with passive notifications (D-019)
+    cognitive_state = gut.gut_summary()
+    if _notification_store:
+        try:
+            pending_notifs = await _notification_store.get_pending_passive(
+                req.agent_id, limit=NOTIFICATION_MAX_PASSIVE_PER_CONTEXT,
+            )
+            if pending_notifs:
+                notif_lines = [f"- [{n['source']}] {n['content']}" for n in pending_notifs]
+                cognitive_state += "\n[Pending Notifications]\n" + "\n".join(notif_lines)
+                for n in pending_notifs:
+                    await _notification_store.mark_delivered(n["id"])
+        except Exception as e:
+            logger.warning("Passive notification fetch failed for %s: %s", req.agent_id, e)
+
     context = await assemble_context(
         memory_store=store,
         agent_id=req.agent_id,
         attention_embedding=gut.attention_centroid,
         previous_attention_embedding=gut.previous_attention_centroid,
-        cognitive_state_report=gut.gut_summary(),
+        cognitive_state_report=cognitive_state,
         query_text=req.query_text,
         conversation=req.conversation,
         total_budget=req.total_budget,
@@ -1015,3 +1086,60 @@ async def bootstrap_status(agent_id: str = Query(..., description="Agent ID")):
         raise HTTPException(status_code=503, detail="Bootstrap checker not initialized.")
     result = await _bootstrap.check_all(agent_id)
     return BootstrapStatusResponse(**result)
+
+
+# ── Notifications (D-019) ─────────────────────────────────────────
+
+
+class NotificationPreferencesRequest(BaseModel):
+    agent_id: str
+    telegram_chat_id: str | None = None
+    telegram_enabled: bool | None = None
+    quiet_hours_start: int | None = None
+    quiet_hours_end: int | None = None
+    urgency_threshold: float | None = None
+    importance_threshold: float | None = None
+    enabled: bool | None = None
+
+
+class NotificationStatusResponse(BaseModel):
+    delivery_worker_running: bool = False
+    store_initialized: bool = False
+
+
+@app.get("/notifications/pending")
+async def notifications_pending(agent_id: str = Query(..., description="Agent ID")):
+    """Get pending passive notifications for an agent."""
+    if _notification_store is None:
+        raise HTTPException(status_code=503, detail="Notification store not initialized.")
+    pending = await _notification_store.get_pending_passive(agent_id)
+    return {"agent_id": agent_id, "notifications": pending, "count": len(pending)}
+
+
+@app.post("/notifications/preferences")
+async def set_notification_preferences(req: NotificationPreferencesRequest):
+    """Set notification preferences for an agent."""
+    if _notification_store is None:
+        raise HTTPException(status_code=503, detail="Notification store not initialized.")
+    kwargs = {k: v for k, v in req.model_dump().items() if k != "agent_id" and v is not None}
+    await _notification_store.set_preferences(req.agent_id, **kwargs)
+    prefs = await _notification_store.get_preferences(req.agent_id)
+    return {"agent_id": req.agent_id, "preferences": prefs}
+
+
+@app.get("/notifications/preferences/{agent_id}")
+async def get_notification_preferences(agent_id: str):
+    """Get notification preferences for an agent."""
+    if _notification_store is None:
+        raise HTTPException(status_code=503, detail="Notification store not initialized.")
+    prefs = await _notification_store.get_preferences(agent_id)
+    return {"agent_id": agent_id, "preferences": prefs}
+
+
+@app.get("/notifications/status", response_model=NotificationStatusResponse)
+async def notification_status():
+    """Get notification system status."""
+    return NotificationStatusResponse(
+        delivery_worker_running=_delivery_worker.running if _delivery_worker else False,
+        store_initialized=_notification_store is not None,
+    )

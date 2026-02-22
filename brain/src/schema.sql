@@ -53,7 +53,10 @@ CREATE TABLE IF NOT EXISTS memories (
     embed_model     TEXT        DEFAULT 'gemini-embedding-001',
 
     -- Utility score for promotion decisions
-    utility_score   FLOAT       DEFAULT 0.0
+    utility_score   FLOAT       DEFAULT 0.0,
+
+    -- Memory group linking (D-018c): chunks from semantic chunking share group_id
+    memory_group_id TEXT
 );
 
 -- Vector similarity search (HNSW for approximate nearest neighbor)
@@ -84,6 +87,15 @@ CREATE INDEX IF NOT EXISTS idx_memories_tags
 -- Weight center approximation (for consolidation promotion scans)
 CREATE INDEX IF NOT EXISTS idx_memories_weight_center
     ON memories ((depth_weight_alpha / (depth_weight_alpha + depth_weight_beta)));
+
+-- Memory group linking (D-018c): migration + partial index
+DO $$ BEGIN
+    ALTER TABLE memories ADD COLUMN memory_group_id TEXT;
+EXCEPTION WHEN duplicate_column THEN NULL;
+END $$;
+
+CREATE INDEX IF NOT EXISTS idx_memories_group
+    ON memories (memory_group_id) WHERE memory_group_id IS NOT NULL;
 
 
 -- =============================================================================
@@ -198,3 +210,94 @@ CREATE INDEX IF NOT EXISTS idx_injection_logs_memory
 
 CREATE INDEX IF NOT EXISTS idx_injection_logs_query
     ON injection_logs (query_hash);
+
+
+-- =============================================================================
+-- CONTEXT SHIFT BUFFER — Ring buffer for adaptive threshold (D-018a)
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS context_shift_buffer (
+    id          SERIAL      PRIMARY KEY,
+    agent_id    TEXT        NOT NULL,
+    shift_value FLOAT       NOT NULL,
+    created_at  TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_context_shift_agent
+    ON context_shift_buffer (agent_id, created_at DESC);
+
+
+-- =============================================================================
+-- MIGRATIONS — Additive column changes (idempotent)
+-- =============================================================================
+
+-- =============================================================================
+-- NOTIFICATION OUTBOX — Queued notifications with urgency/importance (D-019)
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS notification_outbox (
+    id               SERIAL      PRIMARY KEY,
+    agent_id         TEXT        NOT NULL,
+    content          TEXT        NOT NULL,
+    urgency          FLOAT       NOT NULL DEFAULT 0.0,
+    importance       FLOAT       NOT NULL DEFAULT 0.0,
+    source           TEXT        NOT NULL,
+    source_memory_id TEXT,
+    channel          TEXT        NOT NULL DEFAULT 'passive',
+    status           TEXT        NOT NULL DEFAULT 'pending',
+    metadata         JSONB       DEFAULT '{}',
+    created_at       TIMESTAMPTZ DEFAULT NOW(),
+    delivered_at     TIMESTAMPTZ,
+    expires_at       TIMESTAMPTZ DEFAULT NOW() + INTERVAL '24 hours'
+);
+
+CREATE INDEX IF NOT EXISTS idx_notification_outbox_agent
+    ON notification_outbox (agent_id, status, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_notification_outbox_delivery
+    ON notification_outbox (status, channel, created_at)
+    WHERE status = 'pending';
+
+
+-- =============================================================================
+-- NOTIFICATION PREFERENCES — Per-agent notification settings (D-019)
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS notification_preferences (
+    agent_id             TEXT    PRIMARY KEY,
+    telegram_chat_id     TEXT,
+    telegram_enabled     BOOLEAN DEFAULT FALSE,
+    quiet_hours_start    INT     DEFAULT 23,
+    quiet_hours_end      INT     DEFAULT 7,
+    urgency_threshold    FLOAT   DEFAULT 0.7,
+    importance_threshold FLOAT   DEFAULT 0.5,
+    enabled              BOOLEAN DEFAULT TRUE,
+    updated_at           TIMESTAMPTZ DEFAULT NOW()
+);
+
+
+-- =============================================================================
+-- RESEARCH QUEUE — 2-search confirmation for contradiction research (D-016/DJ-008)
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS research_queue (
+    id                      SERIAL      PRIMARY KEY,
+    agent_id                TEXT        NOT NULL,
+    tension_id              TEXT        NOT NULL,
+    mem_a_id                TEXT        NOT NULL,
+    mem_b_id                TEXT        NOT NULL,
+    classification          JSONB       NOT NULL,
+    status                  TEXT        NOT NULL DEFAULT 'pending',
+    first_result            JSONB,
+    second_result           JSONB,
+    created_at              TIMESTAMPTZ DEFAULT NOW(),
+    first_researched_at     TIMESTAMPTZ,
+    second_researched_at    TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_research_queue_status
+    ON research_queue (status, created_at);
+
+
+-- D-021: insight_level for meta-insight exclusion in pattern detection
+-- 0 = regular memory, 1 = insight, 2 = meta-insight (excluded from future clustering)
+DO $$ BEGIN
+    ALTER TABLE memories ADD COLUMN insight_level INT DEFAULT 0;
+EXCEPTION WHEN duplicate_column THEN NULL;
+END $$;
