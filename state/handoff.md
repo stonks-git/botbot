@@ -7,134 +7,65 @@
 
 ## Previous Sessions
 
-### SESSION 2026-02-23 (#29) - T-P15 + T-P17 + T-P16 + T-P11 (4 P3 features)
+### SESSION 2026-02-23 (#42) - Deploy BUG-003, JSONB Codec Fix, Dedup Prompt Rewrite
 
 **STATUS:** DONE
 
 **What was done:**
+1. **Deployed BUG-003 fix:** Applied migration 004 (survivor_label column), rebuilt brain+openclaw containers. All 3 services healthy.
+2. **BUG-004 (asyncpg JSONB codec):** Dedup sweep hit DataError — asyncpg doesn't auto-encode dicts for JSONB without registered codecs. Fixed: registered `json`/`jsonb` type codecs via `set_type_codec` on pool `init` callback in `db.py`. Removed all manual `json.dumps()` wrappers for JSONB params across memory.py (store_memory, scratch_buffer, archive_memory), notification.py (enqueue), idle.py (3 consolidation_log inserts). Supersedes BUG-002 workaround.
+3. **Dedup prompt rewrite:** Old prompt caused LLM to default "synthesize" 80%+ without text. Rewrote with explicit structured options and "YOU MUST write merged text" instruction. LLM now correctly picks A/B for near-duplicates.
+4. **Synthesis caching:** Added `synthesis TEXT` column to `dedup_verdicts`. Cache path returned `synthesis: None` always — LLM synthesis text was lost on re-lookup. Now stored on INSERT, returned from cache.
+5. **POC verified:** 13 pairs deduped live — 10 correct A/B picks (new prompt), 3 old-cache fallbacks. All archived with weight transfer. No errors.
+6. **DB wipe (D-035):** 490 active memories with 75,327 duplicate pairs at >= 0.85 similarity. DMN feedback loop created massive identity paraphrase wall. Incremental dedup impractical (~100h of LLM calls). Deleted all default agent data. Brain+OpenClaw stopped.
 
-1. **T-P15: Adaptive context shift threshold (D-018a)** — Added `context_shift_buffer` table (ring buffer of 200 values). `_get_adaptive_threshold()` returns P75 percentile (default 0.5 when < 200 values). Identity cache per agent (`_identity_cache`), invalidated when shift >= threshold. Replaced hardcoded 0.7 with adaptive threshold for inertia.
+**Files modified:** brain/src/db.py, brain/src/memory.py, brain/src/notification.py, brain/src/idle.py, brain/src/consolidation.py
+**Next:** T-D034 (context leak: prependContext → systemPrompt + strip prefix from auto-capture). Fresh agent restart.
 
-2. **T-P17: HDBSCAN pattern detection (D-021)** — Added `hdbscan>=0.8.38` to requirements. Added `insight_level` column migration. `_hdbscan_cluster()` function. Replaced `_pattern_detection()` body with HDBSCAN clustering, per-cluster LLM analysis (insight_level=1), cross-cluster meta-insights (insight_level=2). Schedule changed from 15min to 1/day. Added `build-essential` to Dockerfile.
+### SESSION 2026-02-23 (#41) - BUG-003 Fix: Dedup Engine + Retroactive Sweep Endpoint
 
-3. **T-P16: Consolidation research sessions (D-016/DJ-008)** — Added `research_queue` table. `llm_call_with_search()` + retry wrapper using Gemini GoogleSearch tool. Research config constants. Classification, rate limiting, 2-search confirmation lifecycle. Structural confidence from grounding chunks. Safe mode: displacement only when 2 independent searches agree.
+**STATUS:** DONE (code complete, deploy + sweep pending)
 
-4. **T-P11: Proactive notification system (D-019)** — Created `brain/src/notification.py` with NotificationStore + DeliveryWorker. Added `notification_outbox` + `notification_preferences` tables. Wired into api.py (lifespan + 4 endpoints + passive injection in /context/assemble), consolidation.py (contradiction + research triggers), idle.py (DMN goal/identity triggers).
+**What was done:**
+1. **Bug A fix (synthesis fallback):** `execute_dedup_verdict()` now has a fallback path: when LLM says "synthesize" but provides no text (or unknown label), queries both memories for `weight_center`, picks higher as survivor, archives loser with weight transfer. File: `memory.py:949-979`.
+2. **Bug B fix (cache dict):** `dedup_pair()` cache-hit SELECT now fetches `survivor_label, reason, mem_a_id, mem_b_id`. Reconstructs full verdict dict with all keys `execute_dedup_verdict` needs (`survivor`, `loser_id`, `mem_a_id`, `mem_b_id`, `reason`, `synthesis`). Backward-compatible: old NULL `survivor_label` rows derived from `survivor_id` ("A"/"B"), or left None for "synthesize" case (hits BUG-003 fallback). File: `consolidation.py:110-143`.
+3. **Schema + migration:** Added `survivor_label TEXT` to `dedup_verdicts` CREATE TABLE + idempotent DO $$ ALTER TABLE block in `schema.sql`. Migration `004_survivor_label.sql`. INSERT in `dedup_pair` now stores `survivor_label` as 7th column.
+4. **Retroactive sweep endpoint:** `POST /consolidation/dedup-sweep` — pgvector self-join finds high-similarity pairs (`1 - cosine_distance >= threshold`), runs `dedup_pair` + `execute_dedup_verdict` on each. `dry_run=true` default. Request/response models with pair count, redundant/archived/distinct/error counts.
+5. **Docker build verified:** `docker compose build brain` succeeds. All 3 modified .py files pass `py_compile`.
 
-5. **Schema fix** — Added `memory_group_id` column migration (DO/EXCEPTION block) before `idx_memories_group` index to fix startup on existing DBs.
+**Files modified:** brain/src/consolidation.py, brain/src/memory.py, brain/src/api.py, brain/src/schema.sql
+**Files created:** brain/migrations/004_survivor_label.sql
+**Next:** Deploy (apply migration 004, rebuild containers), run dry sweep, then live sweep. Then T-D034.
 
-| File | What was done |
-|------|---------------|
-| `brain/src/schema.sql` | context_shift_buffer, notification_outbox, notification_preferences, research_queue tables. insight_level + memory_group_id migrations |
-| `brain/src/config.py` | Research constants, notification constants, research_finding type prefix |
-| `brain/src/context_assembly.py` | Adaptive threshold, identity cache, _get_adaptive_threshold(), _record_context_shift() |
-| `brain/src/consolidation.py` | HDBSCAN clustering, _hdbscan_cluster(), research methods (_classify, _queue, _process, _first, _confirmation), notification triggers |
-| `brain/src/memory.py` | insight_level param on store_insight() |
-| `brain/src/llm.py` | llm_call_with_search(), retry_llm_call_with_search() |
-| `brain/src/notification.py` | NEW: NotificationStore, DeliveryWorker |
-| `brain/src/api.py` | Notification imports/globals/lifespan/endpoints, passive injection in /context/assemble |
-| `brain/src/idle.py` | notification_store param, DMN/goal + DMN/identity notification triggers |
-| `brain/requirements.txt` | hdbscan>=0.8.38 |
-| `brain/Dockerfile` | build-essential for hdbscan C extension compilation |
-| `KB/KB_01_architecture.md` | DJ-008, all 4 features documented, dependency graph updated |
-| `state/roadmap.json` | T-P15/T-P17/T-P16/T-P11 → done, D-016 → superseded |
-
-### SESSION 2026-02-22 (#28) - T-B06: Code Hygiene Pass (11 audit findings)
+### SESSION 2026-02-23 (#40) - Investigation + D-033 Priority Injection Bypass
 
 **STATUS:** DONE
 
 **What was done:**
+1. **Memory DB investigation:** Queried live DB. 421 memories (0 archived), 311 (74%) are identity navel-gazing. 210 consolidation insights, nearly 1:1 with source memories. Top 30 by weight: all identity paraphrases. DMN self-referential feedback loop identified.
+2. **BUG-003 found: Dedup broken.** 10 dedup verdicts all "redundant", 0 archives executed. Bug A: 8/10 verdicts chose "synthesize" but LLM didn't provide synthesis text → `execute_dedup_verdict` falls through. Bug B: `dedup_verdicts` cache returns only `verdict` + `survivor_id`, missing `survivor` label → `execute_dedup_verdict` can't determine A/B/synthesize code path on cache hits.
+3. **Context leak found:** `prependContext` in OpenClaw is prepended to the USER message (`effectivePrompt`), not system prompt. [ACTIVE IDENTITY] etc. visible in chat. Auto-capture picks up context prefix → `mem_4bda25fd9c01` content starts with `[ACTIVE IDENTITY]`.
+4. **D-033: Priority injection bypass.** Memories with importance >= 0.95 force-injected into [RELEVANT MEMORIES] regardless of w×s scoring. One-shot: importance reset to 0.5 after injection. Covers fired reminders (importance=1.0). Added `PRIORITY_IMPORTANCE_THRESHOLD` to config.py.
 
-1. **Dead code removal (CQ-009/015/018/021)** — Removed `flush_scratch()` from memory.py (never called), `adaptive_fifo_prune()` from context_assembly.py (never called), `OutcomeTracker` class from safety.py (~75 lines, never instantiated), unused `where` param from `avg_depth_weight_center()`.
+**Files modified:** brain/src/config.py, brain/src/context_assembly.py
+**Next:** Fix BUG-003 (dedup) + retroactive sweep of 421 memories
 
-2. **DRY constants (CQ-007/013/020)** — Extracted `WEIGHT_CENTER_SQL` and `NOVELTY_THRESHOLD` to config.py. Replaced 11+ inline SQL occurrences of `depth_weight_alpha / (depth_weight_alpha + depth_weight_beta)` across 8 files with f-string interpolation. Moved `_get_agent_ids()` to db.py as `get_agent_ids()`, removed duplicate definitions from idle.py and consolidation.py. `MERGE_SIMILARITY_THRESHOLD` and gate defaults now reference `NOVELTY_THRESHOLD`.
-
-3. **Minor fixes (CQ-016/017/022/024)** — Fixed `_sample_tension()` in idle.py: removed `embedding::float4[] AS emb_arr` + manual string formatting, pass `embedding` column directly, no-partner return no longer leaks full embedding array. Converted `_audit_log` in safety.py from `list[dict]` with manual `pop(0)` to `collections.deque(maxlen=1000)`. Added `_dirty` flag to gut.py `save()` — skips disk I/O when state hasn't changed.
-
-4. **Deferred** — CQ-011 (monologue UNION: already parallel via asyncio.gather), CQ-012 (O(n^2) clustering: T-P17 HDBSCAN replaces entirely).
-
-| File | What was done |
-|------|---------------|
-| `brain/src/config.py` | Added `NOVELTY_THRESHOLD = 0.85`, `WEIGHT_CENTER_SQL` constant |
-| `brain/src/db.py` | Added shared `get_agent_ids()` function |
-| `brain/src/memory.py` | Removed flush_scratch, fixed avg_depth_weight_center param, used NOVELTY_THRESHOLD + WEIGHT_CENTER_SQL |
-| `brain/src/safety.py` | Removed OutcomeTracker, deque for audit_log, replaced uuid with collections import |
-| `brain/src/context_assembly.py` | Removed adaptive_fifo_prune, used WEIGHT_CENTER_SQL |
-| `brain/src/gate.py` | Imported NOVELTY_THRESHOLD for confirming_sim + decision matrix |
-| `brain/src/consolidation.py` | Imported get_agent_ids/NOVELTY_THRESHOLD/WEIGHT_CENTER_SQL, removed duplicate helper |
-| `brain/src/idle.py` | Imported get_agent_ids/WEIGHT_CENTER_SQL, fixed _sample_tension emb_arr leak |
-| `brain/src/api.py` | Imported WEIGHT_CENTER_SQL for _get_identity_embeddings |
-| `brain/src/bootstrap.py` | Imported WEIGHT_CENTER_SQL for 3 milestone checks |
-| `brain/src/gut.py` | Added _dirty flag for save() optimization |
-| `KB/KB_01_architecture.md` | Config constants, removed dead code refs, updated dependency graph |
-| `state/devlog.ndjson` | 2 entries (refactor + kb_update) |
-| `state/roadmap.json` | T-B06 → done |
-
-### SESSION 2026-02-22 (#27) - T-P14: Semantic Chunking + Memory Groups (D-018b, D-018c)
+### SESSION 2026-02-23 (#39) - Plan 202602221300: Always-On Gut + Decay Protection (All 5 Phases)
 
 **STATUS:** DONE
 
 **What was done:**
+All 5 phases of plan `202602221300-always-on-gut-and-decay-protection.md` implemented. Plan status=done.
+- **Phase 1 (Always-on gut feeding):** Moved `get_identity_embeddings()` to MemoryStore (D-030). Added `_feed_gut()` to IdleLoop (embed → update_attention → update_subconscious → compute_delta → save, exception-safe). Wired into `_heartbeat()` with `sampled_content` tracking across all 3 branches (random pop, continue thread, new thread).
+- **Phase 2 (Decay protection schema):** Added `protect_until TIMESTAMPTZ` column to memories + partial index + migration 003. Wired through `store_memory` ($19), `GateRequest`, `gate_memory` extra_kw (first chunk only).
+- **Phase 3 (Decay exclusion):** Both `_decay_tick` (consolidation.py) and `get_stale_memories` (memory.py) WHERE clauses now skip memories with active `protect_until`.
+- **Phase 4 (Protection expiration + LLM re-eval):** Added `_check_expired_protections()` — queries expired protections (LIMIT 5), runs context assembly + LLM, extends (capped 90d) or releases, audit trail in consolidation_log. Wired into `run()` via `_safe_run_global`.
+- **Phase 5 (Plugin upgrade):** `brainGate()` gets `protectUntil` param. `memory_store` tool schema, destructure, brainGate call, and success message all updated.
 
-1. **memory_group_id column** — `TEXT` nullable column on memories table. Partial index `idx_memories_group ON memories (memory_group_id) WHERE memory_group_id IS NOT NULL`. `store_memory()` accepts optional `memory_group_id` parameter. `brain/src/schema.sql`, `brain/src/memory.py`.
+- **D-032 (Threshold removal + milestones):** Empirical analysis at 391 memories showed top-20 optimal (best discriminative gap 0.036, centroid 99.2% stable). Removed `> 0.3` threshold from `get_identity_embeddings`. Added `_check_memory_milestones()` to idle loop — notifies at 1k/5k/10k to re-run analysis. Verified: `emotional_charge=0.245`, `has_subconscious=true`.
 
-2. **Semantic chunking at gate time** — `semantic_chunk(text, max_tokens=300)` in gate.py: splits by paragraph (`\n\n`), then sentence boundaries, greedily merges under 300-token limit. Gate PERSIST path in api.py: content > 300 tokens → chunks stored as separate memories with shared `memory_group_id` and metadata `{group_part, group_total}`. `brain/src/gate.py`, `brain/src/api.py`.
-
-3. **Group-wide touch_memory** — `touch_memory()` queries `memory_group_id` of target memory. If non-NULL, UPDATEs `last_accessed` on all group siblings. Standalone memories (NULL group_id) use original single-row UPDATE. `brain/src/memory.py`.
-
-4. **Insight group_id inheritance + context annotation** — `store_insight()` queries source memories' `memory_group_id` values. If ALL share the same non-NULL group_id, insight inherits it. `score_identity_wxs()` now includes `metadata` column. `_annotate_chunk()` helper prepends `[part N of M]` to content in context assembly for chunked memories. `brain/src/memory.py`, `brain/src/context_assembly.py`.
-
-| File | What was done |
-|------|---------------|
-| `brain/src/schema.sql` | memory_group_id column + partial index |
-| `brain/src/memory.py` | store_memory memory_group_id param, store_insight group inheritance, group-wide touch_memory, score_identity_wxs +metadata |
-| `brain/src/gate.py` | semantic_chunk() function + _estimate_tokens helper |
-| `brain/src/api.py` | Gate PERSIST chunking path with group_id linking |
-| `brain/src/context_assembly.py` | _annotate_chunk() helper, identity + situational chunk annotation |
-| `state/plans/202602211500-identity-architecture-rework.md` | Phase 3 decomposed + all 4 tasks checked + DONE |
-| `KB/KB_01_architecture.md` | memory groups, semantic chunking, group-wide touch, chunk annotation |
-| `state/devlog.ndjson` | 2 entries (feature + kb_update) |
-| `state/roadmap.json` | T-P14 → done |
-
-### SESSION 2026-02-22 (#25) - T-B05: DMN Channel Fix + Monologue Key + JSONB (CQ-025, CQ-023, CQ-014)
-
-**STATUS:** DONE
-
-**What was done:**
-
-1. **CQ-025: DMN creative channel always wins.** `_classify_channel()` checked `len(activated) > 0` — any memory with even 1 co-access (score 0.05) triggered "DMN/creative", starving identity/reflect channels. Added `MIN_CREATIVE_ACTIVATION = 0.15` constant. Now requires `max(activated.values()) >= 0.15`, meaning ≥3 co-accesses at hop 0 for creative classification.
-
-2. **CQ-023: Monologue key mismatch.** `api.py` monologue endpoint read `ct.get("resolution_reason")` but `rumination.py` stores completed threads with key `"reason"`. Result: resolution_reason always `""`. Fixed to `ct.get("reason")`. API response field name preserved.
-
-3. **CQ-014: JSONB double-serialization.** `_log_consolidation()` passed `json.dumps(details)` string to asyncpg for a JSONB column. asyncpg's default JSONB codec calls `json.dumps()` internally → double-serialized (JSON string literal stored instead of object). `details->>'key'` returned NULL, `isinstance(details, dict)` returned False. Fixed: pass dict directly. Removed unused `import json`.
-
-| File | What was done |
-|------|---------------|
-| `brain/src/idle.py` | CQ-025: Added MIN_CREATIVE_ACTIVATION=0.15, changed _classify_channel creative check |
-| `brain/src/api.py` | CQ-023: Fixed monologue completed thread key from "resolution_reason" to "reason" |
-| `brain/src/consolidation.py` | CQ-014: Pass dict directly to asyncpg JSONB column, removed json import |
-| `KB/KB_01_architecture.md` | Updated _classify_channel, consolidation_log, monologue descriptions |
-| `state/devlog.ndjson` | 4 entries (3 bugfixes + kb_update) |
-| `state/roadmap.json` | T-B05 → done |
-
-### SESSION 2026-02-22 (#23) - T-P12: Identity w×s Scoring + Hash Feature Flag (D-015, D-017)
-
-**STATUS:** DONE
-
-**What was done:**
-
-1. **D-015: Replaced stochastic identity injection with w×s scoring.** Added `score_identity_wxs()` method to MemoryStore — computes `injection_score = weight_center × cosine_sim` entirely in SQL via pgvector `<=>` operator. Context assembly now embeds `query_text` (RETRIEVAL_QUERY task type), calls the scoring method, and injects identity memories ranked by injection_score within `BUDGET_IDENTITY_MAX`. No query = no identity injection (relevance mandatory per DJ-005). Removed stochastic Beta sampling, `_get_top_identity_memories` helper, `IDENTITY_THRESHOLD` constant, and `StochasticWeight` import.
-
-2. **D-017: Identity hash feature-flagged dormant.** Added `IDENTITY_HASH_ENABLED = False` constant. `render_identity_hash()` skipped during context assembly (saves ~100-200 tokens per call). API endpoints `GET /identity/{id}` and `GET /identity/{id}/hash` still functional. System prompt header renamed from `[IDENTITY -- active beliefs/values this cycle]` to `[ACTIVE IDENTITY]`.
-
-| File | What was done |
-|------|---------------|
-| `brain/src/memory.py` | D-015: Added `score_identity_wxs()` method — SQL-native w×s identity scoring |
-| `brain/src/context_assembly.py` | D-015: w×s identity injection loop. D-017: `IDENTITY_HASH_ENABLED=False`. Header → `[ACTIVE IDENTITY]`. Removed stochastic imports + dead helper |
-| `state/plans/202602211500-identity-architecture-rework.md` | Phase 1 decomposed + DONE. Plan status → active |
-| `KB/KB_01_architecture.md` | Updated Phase 3 context assembly description + dependency graph |
-| `state/devlog.ndjson` | 3 entries (2 features + kb_update) |
-| `state/roadmap.json` | T-P12 → done |
+**Files modified:** brain/src/memory.py, brain/src/api.py, brain/src/idle.py, brain/src/schema.sql, brain/src/consolidation.py, openclaw/extensions/memory-brain/index.ts, state/plans/202602221300-always-on-gut-and-decay-protection.md
+**Files created:** brain/migrations/003_protect_until.sql
 
 ---
 
@@ -148,19 +79,45 @@ BotBot bolts the intuitive-AI cognitive architecture (memory with Beta-distribut
 
 | Task ID | Status |
 |---------|--------|
-| T-B01 | DONE — Critical bugs: dir(), N+1 retrieval mutation, N+1 co-access (CQ-001/002/003/004) |
-| T-B02 | DONE — Safety bypass in promotion + decay (CQ-005/006) |
-| T-B03 | DONE — Unreachable bootstrap milestones 5/7/8 (CQ-019) |
-| T-P12 | DONE — Identity w×s scoring + hash feature flag (D-015/D-017) |
-| T-B04 | DONE — True batch embedding + gate redundant search fix (CQ-008/CQ-010) |
-| T-B05 | DONE — DMN channel fix + monologue key + JSONB (CQ-025/CQ-023/CQ-014) |
-| T-P13 | DONE — Injection logging + w×s analytics (D-018d) |
-| T-P14 | DONE — Semantic chunking + memory groups (D-018b, D-018c) |
-| T-B06 | DONE — Code hygiene: dead code, DRY constants, deque, dirty flag, emb_arr fix (11/13 CQ items) |
-| T-P15 | DONE — Adaptive context shift threshold (D-018a) |
-| T-P17 | DONE — HDBSCAN pattern detection (D-021) |
-| T-P16 | DONE — Consolidation research sessions (D-016/DJ-008, safe 2-search mode) |
-| T-P11 | DONE — Proactive notification system (D-019) |
+| D-033 | DONE — Priority injection bypass (config.py + context_assembly.py) |
+| T-BUG3 | DONE — Dedup fix deployed, prompt rewrite, JSONB codec fix, 10 pairs deduped live |
+| T-D034 | OPEN — Context leak: move prependContext → systemPrompt + strip context prefix from auto-capture |
+
+### Next: Dedup Fix + Retroactive Sweep (BUG-003)
+
+**Problem:** 10 dedup verdicts returned "redundant", 0 archives executed. Two bugs:
+- **Bug A (synthesis fallback):** 8/10 LLM verdicts chose "synthesize" without providing text → code falls through
+- **Bug B (cache dict):** dedup_verdicts table lacks `survivor` label column → cache hits return incomplete dict
+
+**Fix plan:**
+1. Add `survivor_label TEXT` column to dedup_verdicts table + migration 004
+2. Store survivor label when recording verdict
+3. On cache hit, reconstruct full dict (loser_id derivable from mem_a_id + mem_b_id + survivor_id)
+4. When synthesis requested but text missing, fall back to picking higher weight_center as survivor
+5. Run retroactive batch dedup sweep on existing 421 memories (cluster by cosine_sim >= 0.75, run dedup_pair on each cluster)
+
+### Next: Context Leak Fix (D-034)
+
+**Problem:** `prependContext` in OpenClaw prepends to user message, not system prompt. Context visible in chat + leaks into auto-capture.
+
+**Fix plan:**
+1. Change plugin to use `systemPrompt` hook field instead of `prependContext`
+2. Add context prefix stripping to auto-capture (strip everything before first user message)
+
+### Completed Plans (summary)
+
+- Plan `202602221300` (always-on gut + decay protection) — all 5 phases done + D-032
+- Plan `202602221100` (memory dedup + conscious store) — all 5 phases done
+- T-B01 through T-P17: All DONE
+
+### Previous Completed Plans
+
+- Plan `202602221100` (memory dedup + conscious store) — all 5 phases done
+- T-B01 through T-P11: All DONE. See git log for details.
+
+### Previous completed tasks (summary)
+
+T-B01 through T-P11: All DONE. See git log for details. Key: w×s identity scoring (D-015), semantic chunking (D-018b/c), HDBSCAN patterns (D-021), research sessions (D-016), notifications (D-019), adaptive threshold (D-018a), injection logging (D-018d), code hygiene (11 CQ items).
 
 ## Blockers or open questions
 
@@ -179,22 +136,29 @@ BotBot bolts the intuitive-AI cognitive architecture (memory with Beta-distribut
 | Where to see DMN/rumination output? | RESOLVED — T-P10: GET /monologue/{agent_id} endpoint + monologue plugin tool |
 | How to validate w×s formula empirically? | OPEN — D-018d logging pipeline needed first |
 | Consolidation pattern detection at scale | RESOLVED — D-021 HDBSCAN implemented (T-P17) |
+| Gut subconscious empty for newborn agents | RESOLVED — D-032: removed 0.3 threshold, top-20 weighted average. Verified: emotional_charge=0.245 |
+| BUG-003: Dedup broken (0 archives) | FIXED + DEPLOYED — Bug A: synthesis fallback. Bug B: cache dict. Bug C: synthesis caching. Bug D: prompt rewrite. BUG-004: JSONB codec. 10 pairs deduped live, verified. |
+| Identity paraphrase wall (74% navel-gazing) | RESOLVED — DB wiped (D-035). 75k dup pairs made sweep impractical. Agent starts fresh with working dedup-on-gate. |
+| Context prefix leaks into auto-capture | OPEN — D-034: prependContext goes into user message. `[ACTIVE IDENTITY]` stored as memory content. |
+| DMN self-referential feedback loop | OPEN — 74% identity memories → DMN samples identity → consolidation creates identity insights → loop. Need novelty gate on consolidation insight creation. |
+| Reminder not surfacing in context | RESOLVED — D-033: priority injection bypass (importance >= 0.95 → force-inject, one-shot). |
 
 ---
 
 ## Git Status
 
 - **Branch:** main
-- **Last commit:** 0e97690 Sessions 20-26: Critical bugfixes, identity w×s scoring, injection logging
-- **Modified (tracked):** KB/KB_01_architecture.md, brain/Dockerfile, brain/requirements.txt, brain/src/api.py, brain/src/bootstrap.py, brain/src/config.py, brain/src/consolidation.py, brain/src/context_assembly.py, brain/src/db.py, brain/src/gate.py, brain/src/gut.py, brain/src/idle.py, brain/src/llm.py, brain/src/memory.py, brain/src/safety.py, brain/src/schema.sql, state/devlog.ndjson, state/handoff.md, state/plans/202602211500-identity-architecture-rework.md, state/roadmap.json
-- **New (untracked):** brain/src/notification.py, openclaw-workspace/.openclaw/, openclaw-workspace/BOOTSTRAP.md, etc.
+- **Last commit:** f994abb Sessions 27-29: Semantic chunking, code hygiene, 4 P3 features
+- **Modified (tracked):** brain/src/{api,bootstrap,config,consolidation,context_assembly,db,gate,idle,memory,notification,schema}.py + schema.sql, openclaw/extensions/memory-brain/index.ts, state/{devlog.ndjson,handoff.md,roadmap.json}, KB/KB_01_architecture.md
+- **New (untracked):** brain/migrations/ (001-004), openclaw-workspace/, state/plans/
+- **Session 42 changes:** brain/src/db.py (JSONB codec), brain/src/memory.py (removed json.dumps), brain/src/notification.py (removed json.dumps), brain/src/idle.py (removed json.dumps), brain/src/consolidation.py (prompt rewrite + synthesis column)
 
 ---
 
 ## Memory Marker
 
 ```
-MEMORY_MARKER: 2026-02-23T03:00:00+02:00 | Session 29 doc finalized | All 4 P3 features done. Plan marked done. D-016 status fixed (amended→superseded). All roadmap tasks complete. | Next: No remaining tasks. Ready for commit.
+MEMORY_MARKER: 2026-02-23T07:00:00+02:00 | Session 42: BUG-003 deployed, BUG-004 JSONB codec, dedup prompt rewrite, synthesis caching, 13 pairs POC, DB wiped (75k dups), services stopped. | Next: T-D034 (context leak), fresh agent restart.
 ```
 
 ---

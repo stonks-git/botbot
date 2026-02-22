@@ -1,8 +1,8 @@
 {
   "meta": {
     "status": "active",
-    "last_updated": "2026-02-21",
-    "session": 21
+    "last_updated": "2026-02-23",
+    "session": 40
   },
   "open_questions": [
     {
@@ -123,6 +123,16 @@
     {
       "id": "D-025",
       "summary": "Insight weight inheritance. store_insight computes weighted-avg alpha/beta from sources (center-weighted). No source importance demotion \u2014 sources keep weight until insight proves itself.",
+      "status": "accepted"
+    },
+    {
+      "id": "D-033",
+      "summary": "Priority injection bypass: memories with importance >= 0.95 force-injected into [RELEVANT MEMORIES] regardless of w\u00d7s scoring. One-shot importance reset to 0.5. Covers fired reminders.",
+      "status": "accepted"
+    },
+    {
+      "id": "D-034",
+      "summary": "Context leak fix: move OpenClaw prependContext to systemPrompt hook field. Strip [ACTIVE IDENTITY] etc. prefix from auto-capture. Prevents brain context sections from appearing in chat and being stored as memory content.",
       "status": "accepted"
     }
   ],
@@ -753,6 +763,61 @@
           "source_demotion": "D-025 removes importance cap on source memories. Insights inherit source weights instead of starting at fixed 1.0/4.0."
         }
       }
+    },
+    {
+      "id": "T-BUG3",
+      "title": "Fix dedup engine (BUG-003) + retroactive sweep",
+      "intent": "Fix two bugs preventing dedup from archiving redundant memories, then run retroactive sweep to clean 421 memories (74% identity navel-gazing). Without this fix, memory DB will grow unboundedly with paraphrases.",
+      "depends_on": [],
+      "priority": "P0",
+      "status": "doing",
+      "owner": "ai",
+      "decisions": ["D-026", "D-027"],
+      "deliverable": "consolidation.py + memory.py bug fixes, migration 004 (survivor_label column), retroactive batch dedup sweep",
+      "acceptance_criteria": [
+        "Bug A fixed: when LLM says 'synthesize' but provides no text, execute_dedup_verdict falls back to picking memory with higher weight_center as survivor",
+        "Bug B fixed: dedup_verdicts table has survivor_label TEXT column, stored on verdict insert, cache hits return full dict with survivor label",
+        "Migration 004 created (idempotent, adds survivor_label column to dedup_verdicts)",
+        "Retroactive sweep: cluster all 421 default-agent memories by cosine_sim >= 0.75, run dedup_pair on each pair, execute verdicts",
+        "Post-sweep: archived count > 0, total active memories significantly reduced from 421",
+        "Existing gate dedup trigger still works (regression test)"
+      ],
+      "verification": [
+        "Query dedup_verdicts \u2014 new rows have non-NULL survivor_label",
+        "Query memories WHERE archived \u2014 count > 0 (dedup actually archiving)",
+        "Store two near-identical memories via gate \u2014 verify one gets archived",
+        "Run retroactive sweep script \u2014 verify paraphrase clusters collapsed"
+      ],
+      "implementation_plan": {
+        "step_1_schema": "Add survivor_label TEXT column to dedup_verdicts table. Migration 004_survivor_label.sql (idempotent DO $$ block). Update schema.sql.",
+        "step_2_store_label": "consolidation.py dedup_pair(): when recording verdict to DB, also store survivor label ('A'/'B'/'synthesize'). Update INSERT at line ~194.",
+        "step_3_cache_reconstruction": "consolidation.py dedup_pair() cache-hit path (line ~121): include survivor_label from DB row. Reconstruct full verdict dict: survivor from label, loser_id derived from mem_a_id + mem_b_id + survivor_id.",
+        "step_4_synthesis_fallback": "memory.py execute_dedup_verdict(): when survivor_label=='synthesize' and verdict.get('synthesis') is falsy, fall back to comparing weight_center of both memories, pick higher as survivor.",
+        "step_5_retroactive_sweep": "One-time script/endpoint: (1) Fetch all non-archived default-agent memories with embeddings. (2) Compute pairwise cosine_sim, cluster pairs >= 0.75. (3) For each cluster, run dedup_pair on all unique pairs. (4) Execute verdicts. (5) Report: N archived, N surviving, N clusters processed.",
+        "step_6_verify": "Check archived count, check active memory count, verify weight transfer happened, spot-check a few archived_reason JSONB entries."
+      }
+    },
+    {
+      "id": "T-D034",
+      "title": "Fix context leak: prependContext \u2192 systemPrompt (D-034)",
+      "intent": "Brain context sections ([ACTIVE IDENTITY], [RELEVANT MEMORIES], [COGNITIVE STATE]) currently appear in user message via prependContext, visible in chat and captured as memory content. Move to systemPrompt hook field.",
+      "depends_on": [],
+      "priority": "P1",
+      "status": "todo",
+      "owner": "ai",
+      "decisions": ["D-034"],
+      "deliverable": "Plugin hook change (prependContext \u2192 systemPrompt) + auto-capture prefix stripping",
+      "acceptance_criteria": [
+        "Plugin before_agent_start returns brain context via systemPrompt instead of prependContext",
+        "Brain context sections no longer visible in webchat user messages",
+        "Auto-capture does not store [ACTIVE IDENTITY] / [RELEVANT MEMORIES] / [COGNITIVE STATE] prefixes as memory content",
+        "No regression in agent behavior (still gets full context)"
+      ],
+      "verification": [
+        "Send message via webchat \u2014 no [ACTIVE IDENTITY] visible in chat",
+        "Check auto-captured memories \u2014 no content starting with '[ACTIVE IDENTITY]' or '[RELEVANT MEMORIES]'",
+        "Verify /context/assemble still returns valid system prompt"
+      ]
     }
   ]
 }

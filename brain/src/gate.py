@@ -330,6 +330,7 @@ class ExitGate:
             "novelty_axis": novelty_axis,
             "spreading_activation": round(s_i, 4),
             "max_similarity": round(max_similarity, 4),
+            "most_similar_id": most_similar_id,
             "contradiction_score": round(contradiction_score, 4),
             "base_score": base_score,
             "emotional_charge": round(emotional_charge, 4),

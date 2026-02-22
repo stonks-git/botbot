@@ -1,5 +1,6 @@
 """Database connection pool and schema migration."""
 
+import json
 import logging
 import os
 from pathlib import Path
@@ -28,7 +29,15 @@ async def init_pool() -> asyncpg.Pool:
         "DATABASE_URL",
         "postgresql://agent:agent_secret@localhost:5432/agent_memory",
     )
-    _pool = await asyncpg.create_pool(db_url, min_size=2, max_size=10)
+    async def _init_connection(conn):
+        await conn.set_type_codec(
+            "jsonb", encoder=json.dumps, decoder=json.loads, schema="pg_catalog"
+        )
+        await conn.set_type_codec(
+            "json", encoder=json.dumps, decoder=json.loads, schema="pg_catalog"
+        )
+
+    _pool = await asyncpg.create_pool(db_url, min_size=2, max_size=10, init=_init_connection)
     logger.info("Database pool created.")
 
     await _run_schema(_pool)
@@ -45,7 +54,7 @@ async def _run_schema(pool: asyncpg.Pool) -> None:
 
 async def get_agent_ids(pool: asyncpg.Pool) -> list[str]:
     """Get all distinct agent IDs that have memories."""
-    rows = await pool.fetch("SELECT DISTINCT agent_id FROM memories")
+    rows = await pool.fetch("SELECT DISTINCT agent_id FROM memories WHERE NOT archived")
     return [r["agent_id"] for r in rows]
 
 

@@ -16,7 +16,7 @@ import hashlib
 import logging
 
 from .activation import cosine_similarity
-from .config import WEIGHT_CENTER_SQL
+from .config import PRIORITY_IMPORTANCE_THRESHOLD, WEIGHT_CENTER_SQL
 
 logger = logging.getLogger("brain.context")
 
@@ -219,13 +219,62 @@ async def assemble_context(
     if cognitive_state_report:
         used_tokens += _estimate_tokens(cognitive_state_report)
 
+    # Priority injection bypass (D-033): force-inject high-importance memories
+    # (e.g., fired reminders with importance=1.0) regardless of w×s scoring.
+    # One-shot: importance reset to 0.5 after injection so it doesn't repeat.
+    priority_tokens = 0
+    try:
+        priority_rows = await memory_store.pool.fetch(
+            """
+            SELECT id, content, type, metadata, importance,
+                   depth_weight_alpha, depth_weight_beta
+            FROM memories
+            WHERE agent_id = $1 AND NOT archived
+              AND importance >= $2
+              AND id != ALL($3::text[])
+            ORDER BY importance DESC
+            LIMIT 5
+            """,
+            agent_id,
+            PRIORITY_IMPORTANCE_THRESHOLD,
+            injected_memory_ids or [""],
+        )
+        priority_ids = []
+        for row in priority_rows:
+            mem = dict(row)
+            content = _annotate_chunk(mem)
+            tokens = _estimate_tokens(content)
+            parts["situational"].append(content)
+            priority_tokens += tokens
+            injected_memory_ids.append(mem["id"])
+            priority_ids.append(mem["id"])
+            logger.info(
+                "Priority injection: %s (importance=%.2f) [%s]",
+                mem["id"], mem["importance"], agent_id,
+            )
+        # One-shot: reset importance so these don't force-inject every turn
+        if priority_ids:
+            await memory_store.pool.execute(
+                """
+                UPDATE memories SET importance = 0.5
+                WHERE id = ANY($1::text[]) AND agent_id = $2
+                """,
+                priority_ids,
+                agent_id,
+            )
+    except Exception:
+        logger.warning("Priority injection query failed for %s", agent_id)
+    used_tokens += priority_tokens
+
     # Track 1: situational (competition-based)
     situational_budget = min(
-        BUDGET_SITUATIONAL, total_budget - used_tokens - BUDGET_OUTPUT_BUFFER
+        BUDGET_SITUATIONAL - priority_tokens,
+        total_budget - used_tokens - BUDGET_OUTPUT_BUFFER,
     )
     if situational_budget > 0 and query_text:
         situational = await _get_situational_memories(
-            memory_store, agent_id, query_text, situational_budget
+            memory_store, agent_id, query_text, situational_budget,
+            exclude_ids=set(injected_memory_ids),
         )
         for mem in situational:
             content = mem.get("compressed") or mem["content"]
@@ -233,7 +282,7 @@ async def assemble_context(
             parts["situational"].append(content)
             if mem.get("id"):
                 injected_memory_ids.append(mem["id"])
-    used_tokens += sum(_estimate_tokens(s) for s in parts["situational"])
+    used_tokens += sum(_estimate_tokens(s) for s in parts["situational"]) - priority_tokens
 
     # Context inertia (D-018a: adaptive threshold replaces hardcoded 0.7)
     # context_shift already computed above for identity cache gating
@@ -301,6 +350,7 @@ async def render_identity_hash(memory_store, agent_id: str) -> str:
                {WEIGHT_CENTER_SQL} AS center
         FROM memories
         WHERE agent_id = $1
+          AND NOT archived
           AND {WEIGHT_CENTER_SQL} > 0.3
         ORDER BY {WEIGHT_CENTER_SQL} DESC
         LIMIT $2
@@ -341,6 +391,7 @@ async def render_identity_full(memory_store, agent_id: str) -> str:
                {WEIGHT_CENTER_SQL} AS center
         FROM memories
         WHERE agent_id = $1
+          AND NOT archived
           AND {WEIGHT_CENTER_SQL} > 0.2
         ORDER BY {WEIGHT_CENTER_SQL} DESC
         LIMIT $2
@@ -428,14 +479,15 @@ def _annotate_chunk(mem: dict, content: str | None = None) -> str:
 async def _get_immutable_memories(memory_store, agent_id: str) -> list[dict]:
     """Fetch memories marked as immutable (safety boundaries)."""
     rows = await memory_store.pool.fetch(
-        "SELECT id, content FROM memories WHERE agent_id = $1 AND immutable = true",
+        "SELECT id, content FROM memories WHERE agent_id = $1 AND NOT archived AND immutable = true",
         agent_id,
     )
     return [dict(r) for r in rows]
 
 
 async def _get_situational_memories(
-    memory_store, agent_id: str, query_text: str, budget: int
+    memory_store, agent_id: str, query_text: str, budget: int,
+    exclude_ids: set[str] | None = None,
 ) -> list[dict]:
     """Fetch situational memories via hybrid search within token budget."""
     if not query_text:
@@ -444,6 +496,8 @@ async def _get_situational_memories(
     candidates = await memory_store.search_hybrid(
         query=query_text, agent_id=agent_id, top_k=10, mutate=False
     )
+    if exclude_ids:
+        candidates = [m for m in candidates if m.get("id") not in exclude_ids]
 
     result: list[dict] = []
     used = 0

@@ -107,16 +107,21 @@ async function brainGate(
   content: string,
   source: string | null = null,
   sourceTag = "auto_capture",
+  remindAt?: string,
+  protectUntil?: string,
 ): Promise<GateResult | null> {
   try {
+    const body: Record<string, unknown> = {
+      agent_id: agentId,
+      content,
+      source,
+      source_tag: sourceTag,
+    };
+    if (remindAt) body.remind_at = remindAt;
+    if (protectUntil) body.protect_until = protectUntil;
     const resp = await brainFetch(baseUrl, "/memory/gate", {
       method: "POST",
-      body: JSON.stringify({
-        agent_id: agentId,
-        content,
-        source,
-        source_tag: sourceTag,
-      }),
+      body: JSON.stringify(body),
     });
     if (!resp.ok) return null;
     return (await resp.json()) as GateResult;
@@ -471,6 +476,12 @@ function formatMemoriesContext(
   ].join("\n");
 }
 
+/** Strip inline directive tags ([[reply_to_current]], [[audio_as_voice]], etc.) before capture. */
+const DIRECTIVE_TAG_RE = /\[\[\s*[^\]\n]+\s*\]\]/g;
+function stripDirectiveTags(text: string): string {
+  return text.replace(DIRECTIVE_TAG_RE, "").replace(/\s{2,}/g, " ").trim();
+}
+
 function shouldCapture(text: string): boolean {
   if (!text || text.length < 10) return false;
   // Skip mechanical/command content
@@ -648,6 +659,18 @@ const memoryBrainPlugin = {
               description: "Optional tags for categorization",
             }),
           ),
+          remind_at: Type.Optional(
+            Type.String({
+              description:
+                "ISO 8601 datetime for scheduled reminder (e.g. 2026-02-23T10:00:00Z)",
+            }),
+          ),
+          protect_until: Type.Optional(
+            Type.String({
+              description:
+                "ISO 8601 datetime until which this memory is protected from decay (e.g. 2026-03-22T00:00:00Z)",
+            }),
+          ),
         }),
         async execute(_toolCallId, params) {
           const {
@@ -655,21 +678,26 @@ const memoryBrainPlugin = {
             importance = 0.7,
             type: memType,
             tags = [],
+            remind_at,
+            protect_until,
           } = params as {
             text: string;
             importance?: number;
             type?: string;
             tags?: string[];
+            remind_at?: string;
+            protect_until?: string;
           };
 
           const resolvedType = memType ?? detectType(text);
-          const result = await brainStore(
+          const result = await brainGate(
             cfg.brainUrl,
             cfg.agentId,
             text,
-            resolvedType,
-            importance,
-            tags,
+            null,
+            "agent_deliberate",
+            remind_at,
+            protect_until,
           );
 
           if (!result) {
@@ -681,15 +709,38 @@ const memoryBrainPlugin = {
             };
           }
 
-          return {
-            content: [
-              {
-                type: "text",
-                text: `Stored [${resolvedType}]: "${text.slice(0, 100)}${text.length > 100 ? "..." : ""}"`,
-              },
-            ],
-            details: { action: "created", id: result.id, type: resolvedType },
-          };
+          const decision = result.decision.toLowerCase();
+          if (decision.includes("persist")) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `Stored [${resolvedType}]: "${text.slice(0, 100)}${text.length > 100 ? "..." : ""}"${remind_at ? ` (reminder: ${remind_at})` : ""}${protect_until ? ` (protected until: ${protect_until})` : ""}`,
+                },
+              ],
+              details: { action: "created", id: result.memory_id, type: resolvedType, decision },
+            };
+          } else if (decision.includes("reinforce")) {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `Reinforced existing memory: "${text.slice(0, 100)}${text.length > 100 ? "..." : ""}"`,
+                },
+              ],
+              details: { action: "reinforced", id: result.memory_id, decision },
+            };
+          } else {
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `Gate decided "${decision}" — content not novel enough to store.`,
+                },
+              ],
+              details: { action: decision, decision },
+            };
+          }
         },
       },
       { name: "memory_store" },
@@ -1162,7 +1213,7 @@ const memoryBrainPlugin = {
 
             const content = msgObj.content;
             if (typeof content === "string") {
-              captured.push({ text: content, sourceTag });
+              captured.push({ text: stripDirectiveTags(content), sourceTag });
               continue;
             }
             if (Array.isArray(content)) {
@@ -1176,7 +1227,7 @@ const memoryBrainPlugin = {
                   typeof (block as Record<string, unknown>).text === "string"
                 ) {
                   captured.push({
-                    text: (block as Record<string, unknown>).text as string,
+                    text: stripDirectiveTags((block as Record<string, unknown>).text as string),
                     sourceTag,
                   });
                 }

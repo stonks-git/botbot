@@ -90,6 +90,171 @@ async def _log_consolidation(
     )
 
 
+async def dedup_pair(
+    pool: asyncpg.Pool,
+    store: MemoryStore,
+    agent_id: str,
+    mem_a_id: str,
+    mem_b_id: str,
+) -> dict | None:
+    """Compare two memories via LLM and decide redundant vs distinct.
+
+    Normalizes pair order so (X,Y) and (Y,X) hit the same dedup_verdicts row.
+    Returns verdict dict or None on unrecoverable error.
+    """
+    import json
+
+    # Normalize pair order for consistent dedup_verdicts lookups
+    a, b = sorted([mem_a_id, mem_b_id])
+
+    # Check if already judged
+    existing = await pool.fetchrow(
+        """
+        SELECT verdict, survivor_id, survivor_label, reason,
+               mem_a_id, mem_b_id, synthesis
+        FROM dedup_verdicts
+        WHERE agent_id = $1 AND mem_a_id = $2 AND mem_b_id = $3
+        """,
+        agent_id,
+        a,
+        b,
+    )
+    if existing:
+        survivor_id = existing["survivor_id"]
+        label = existing["survivor_label"]  # may be NULL for old rows
+        # Derive loser_id from pair IDs + survivor_id
+        loser_id = None
+        if survivor_id == a:
+            loser_id = b
+        elif survivor_id == b:
+            loser_id = a
+        # Old rows without survivor_label: derive from survivor_id
+        if label is None and survivor_id is not None:
+            label = "A" if survivor_id == a else "B"
+        return {
+            "verdict": existing["verdict"],
+            "survivor_id": survivor_id,
+            "loser_id": loser_id,
+            "mem_a_id": a,
+            "mem_b_id": b,
+            "reason": existing["reason"] or "",
+            "synthesis": existing.get("synthesis"),
+            "survivor": label,
+        }
+
+    # Fetch both memories
+    rows = await pool.fetch(
+        """
+        SELECT id, content, depth_weight_alpha, depth_weight_beta
+        FROM memories
+        WHERE id = ANY($1) AND agent_id = $2 AND NOT archived
+        """,
+        [a, b],
+        agent_id,
+    )
+    mem_map = {r["id"]: r for r in rows}
+
+    if a not in mem_map or b not in mem_map:
+        # One or both missing/archived — record as distinct, nothing to merge
+        await pool.execute(
+            """
+            INSERT INTO dedup_verdicts (agent_id, mem_a_id, mem_b_id, verdict, reason)
+            VALUES ($1, $2, $3, 'distinct', 'one or both memories missing/archived')
+            ON CONFLICT (agent_id, mem_a_id, mem_b_id) DO NOTHING
+            """,
+            agent_id,
+            a,
+            b,
+        )
+        return {"verdict": "distinct", "survivor_id": None}
+
+    # LLM arbitration
+    prompt = (
+        "Compare these two memories. Are they redundant paraphrases of the same idea?\n"
+        f'Memory A: "{mem_map[a]["content"][:500]}"\n'
+        f'Memory B: "{mem_map[b]["content"][:500]}"\n\n'
+        "If distinct: both capture different ideas — keep both.\n"
+        "If redundant, choose ONE option:\n"
+        '  - "survivor": "A" or "B" — if one is clearly better worded.\n'
+        '  - "survivor": "synthesize" — if neither is good enough alone. '
+        "YOU MUST then write the merged text in the \"synthesis\" field. "
+        "This is a NEW memory that replaces both. It must be a complete sentence.\n\n"
+        'Respond ONLY as JSON:\n'
+        '{"verdict": "redundant" or "distinct", "survivor": "A" or "B" or "synthesize", '
+        '"synthesis": "<merged text or null>", "reason": "one sentence"}'
+    )
+
+    try:
+        response = await retry_llm_call(prompt, temperature=0.2)
+    except RuntimeError:
+        logger.warning("Dedup LLM call failed for pair (%s, %s)", a, b)
+        return None
+
+    # Parse JSON (handle ```json fences)
+    text = response.strip()
+    if text.startswith("```"):
+        text = text.split("```")[1]
+        if text.startswith("json"):
+            text = text[4:]
+    try:
+        result = json.loads(text)
+    except json.JSONDecodeError:
+        logger.warning("Dedup JSON parse failed for pair (%s, %s): %s", a, b, text[:200])
+        # Default to distinct on parse failure
+        result = {"verdict": "distinct", "survivor": None, "synthesis": None, "reason": "parse failure"}
+
+    verdict = result.get("verdict", "distinct")
+    survivor_label = result.get("survivor")
+    synthesis = result.get("synthesis")
+    reason = result.get("reason", "")
+
+    # Map survivor label to IDs
+    survivor_id = None
+    loser_id = None
+    if verdict == "redundant":
+        if survivor_label == "A":
+            survivor_id, loser_id = a, b
+        elif survivor_label == "B":
+            survivor_id, loser_id = b, a
+        # "synthesize" leaves both as None — caller handles
+
+    # Record verdict (BUG-003: store survivor_label for cache reconstruction)
+    await pool.execute(
+        """
+        INSERT INTO dedup_verdicts (agent_id, mem_a_id, mem_b_id, verdict, survivor_id, survivor_label, reason, synthesis)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        ON CONFLICT (agent_id, mem_a_id, mem_b_id) DO NOTHING
+        """,
+        agent_id,
+        a,
+        b,
+        verdict,
+        survivor_id,
+        survivor_label,
+        reason,
+        synthesis,
+    )
+
+    await _log_consolidation(pool, agent_id, "dedup_verdict", {
+        "mem_a_id": a,
+        "mem_b_id": b,
+        "verdict": verdict,
+        "survivor_id": survivor_id,
+        "reason": reason,
+    })
+
+    return {
+        "verdict": verdict,
+        "survivor_id": survivor_id,
+        "loser_id": loser_id,
+        "mem_a_id": a,
+        "mem_b_id": b,
+        "reason": reason,
+        "synthesis": synthesis,
+        "survivor": survivor_label,
+    }
+
+
 def _greedy_cluster(
     items: list[tuple[str, np.ndarray]],
     threshold: float,
@@ -229,9 +394,11 @@ class ConstantConsolidation:
             SET depth_weight_beta = depth_weight_beta + $1,
                 updated_at = NOW()
             WHERE agent_id = $2
+              AND NOT archived
               AND (last_accessed IS NULL OR last_accessed < $3)
               AND NOT immutable
               AND {WEIGHT_CENTER_SQL} > 0.1
+              AND (protect_until IS NULL OR protect_until < NOW())
             """,
             DECAY_NUDGE_AMOUNT,
             agent_id,
@@ -256,6 +423,7 @@ class ConstantConsolidation:
             """
             SELECT id, content FROM memories
             WHERE agent_id = $1
+              AND NOT archived
               AND created_at > NOW() - INTERVAL '24 hours'
               AND type NOT IN ('tension', 'correction')
             ORDER BY created_at DESC LIMIT 10
@@ -354,7 +522,7 @@ class ConstantConsolidation:
             centers = await self.pool.fetch(
                 f"""
                 SELECT id, {WEIGHT_CENTER_SQL} AS center, source_tag
-                FROM memories WHERE id = ANY($1) AND agent_id = $2
+                FROM memories WHERE id = ANY($1) AND agent_id = $2 AND NOT archived
                 """,
                 [mem_a["id"], mem_b["id"]],
                 agent_id,
@@ -476,8 +644,8 @@ class ConstantConsolidation:
             f"Research this factual question using web search:\n{question}\n\n"
             "Provide a clear, factual answer based on search results. "
             "State which of the following is correct:\n"
-            f'A: "{(await self.pool.fetchval("SELECT content FROM memories WHERE id=$1", item["mem_a_id"]) or "")[:300]}"\n'
-            f'B: "{(await self.pool.fetchval("SELECT content FROM memories WHERE id=$1", item["mem_b_id"]) or "")[:300]}"\n\n'
+            f'A: "{(await self.pool.fetchval("SELECT content FROM memories WHERE id=$1 AND NOT archived", item["mem_a_id"]) or "")[:300]}"\n'
+            f'B: "{(await self.pool.fetchval("SELECT content FROM memories WHERE id=$1 AND NOT archived", item["mem_b_id"]) or "")[:300]}"\n\n'
             'Respond with: {"verdict": "A" or "B" or "neither", '
             '"explanation": "brief explanation", "confidence": "HIGH/MEDIUM/LOW"}'
         )
@@ -591,7 +759,6 @@ class ConstantConsolidation:
             # Both searches agree — displace the loser via safety
             first_text = first.get("text", "")
             # Determine which memory to displace from first result
-            import re
             loser_id = None
             if '"verdict": "A"' in first_text or '"verdict":"A"' in first_text:
                 loser_id = item["mem_b_id"]
@@ -606,13 +773,13 @@ class ConstantConsolidation:
                     )
                     if allowed:
                         await self.pool.execute(
-                            "UPDATE memories SET depth_weight_beta = depth_weight_beta + $1 WHERE id = $2",
+                            "UPDATE memories SET depth_weight_beta = depth_weight_beta + $1 WHERE id = $2 AND NOT archived",
                             adj_beta, loser_id,
                         )
                         logger.info("Research displaced memory %s (beta += %.1f)", loser_id, adj_beta)
                 else:
                     await self.pool.execute(
-                        "UPDATE memories SET depth_weight_beta = depth_weight_beta + $1 WHERE id = $2",
+                        "UPDATE memories SET depth_weight_beta = depth_weight_beta + $1 WHERE id = $2 AND NOT archived",
                         RESEARCH_DISPLACE_BETA, loser_id,
                     )
 
@@ -668,6 +835,7 @@ class ConstantConsolidation:
                    {WEIGHT_CENTER_SQL} AS center
             FROM memories
             WHERE agent_id = $1
+              AND NOT archived
               AND embedding IS NOT NULL
               AND {WEIGHT_CENTER_SQL} > $2
               AND access_count >= $3
@@ -934,6 +1102,7 @@ class DeepConsolidation:
             """
             SELECT id, content FROM memories
             WHERE agent_id = $1
+              AND NOT archived
               AND created_at > NOW() - INTERVAL '7 days'
               AND type NOT IN ('tension')
             ORDER BY created_at DESC LIMIT 30
@@ -1054,6 +1223,7 @@ class DeepConsolidation:
             SELECT id, content, embedding::float4[] AS embedding_arr
             FROM memories
             WHERE agent_id = $1
+              AND NOT archived
               AND type = 'reflection'
               AND embedding IS NOT NULL
             ORDER BY created_at DESC LIMIT 30
@@ -1135,6 +1305,7 @@ class DeepConsolidation:
                    {WEIGHT_CENTER_SQL} AS center
             FROM memories
             WHERE agent_id = $1
+              AND NOT archived
               AND access_count >= $2
               AND created_at < NOW() - INTERVAL '1 day' * $3
               AND {WEIGHT_CENTER_SQL} < 0.65
@@ -1163,7 +1334,7 @@ class DeepConsolidation:
                 UPDATE memories
                 SET depth_weight_alpha = depth_weight_alpha + $1,
                     updated_at = NOW()
-                WHERE id = $2 AND agent_id = $3
+                WHERE id = $2 AND agent_id = $3 AND NOT archived
                 """,
                 gain,
                 row["id"],
@@ -1179,6 +1350,7 @@ class DeepConsolidation:
                    {WEIGHT_CENTER_SQL} AS center
             FROM memories
             WHERE agent_id = $1
+              AND NOT archived
               AND access_count >= $2
               AND created_at < NOW() - INTERVAL '1 day' * $3
               AND {WEIGHT_CENTER_SQL} BETWEEN 0.65 AND 0.82
@@ -1207,7 +1379,7 @@ class DeepConsolidation:
                 UPDATE memories
                 SET depth_weight_alpha = depth_weight_alpha + $1,
                     updated_at = NOW()
-                WHERE id = $2 AND agent_id = $3
+                WHERE id = $2 AND agent_id = $3 AND NOT archived
                 """,
                 gain,
                 row["id"],
@@ -1275,7 +1447,7 @@ class DeepConsolidation:
                 UPDATE memories
                 SET depth_weight_beta = depth_weight_beta + $1,
                     updated_at = NOW()
-                WHERE id = ANY($2) AND agent_id = $3
+                WHERE id = ANY($2) AND agent_id = $3 AND NOT archived
                 """,
                 DECAY_CONTRADICT_AMOUNT,
                 decayed_ids,
@@ -1295,6 +1467,7 @@ class DeepConsolidation:
             SELECT id, content, depth_weight_alpha, depth_weight_beta
             FROM memories
             WHERE agent_id = $1
+              AND NOT archived
               AND type = 'reflection'
               AND source = 'consolidation'
             ORDER BY created_at DESC LIMIT 10
@@ -1359,7 +1532,7 @@ class DeepConsolidation:
                             UPDATE memories
                             SET depth_weight_beta = depth_weight_beta + $1,
                                 updated_at = NOW()
-                            WHERE id = $2 AND agent_id = $3
+                            WHERE id = $2 AND agent_id = $3 AND NOT archived
                             """,
                             DECAY_CONTRADICT_AMOUNT,
                             insight_row["id"],
@@ -1396,7 +1569,7 @@ class DeepConsolidation:
             f"""
             SELECT {WEIGHT_CENTER_SQL} AS center
             FROM memories
-            WHERE agent_id = $1 AND NOT immutable
+            WHERE agent_id = $1 AND NOT immutable AND NOT archived
             """,
             agent_id,
         )
@@ -1442,6 +1615,7 @@ class DeepConsolidation:
             SELECT id, content, type, source, created_at
             FROM memories
             WHERE agent_id = $1
+              AND NOT archived
               AND content_contextualized IS NULL
               AND type NOT IN ('tension')
             ORDER BY created_at DESC LIMIT 20
@@ -1474,7 +1648,7 @@ class DeepConsolidation:
                     UPDATE memories
                     SET content_contextualized = $1,
                         updated_at = NOW()
-                    WHERE id = $2 AND agent_id = $3
+                    WHERE id = $2 AND agent_id = $3 AND NOT archived
                     """,
                     full_contextualized,
                     row["id"],
@@ -1490,7 +1664,7 @@ class DeepConsolidation:
                     UPDATE memories
                     SET embedding = $1::halfvec,
                         updated_at = NOW()
-                    WHERE id = $2 AND agent_id = $3
+                    WHERE id = $2 AND agent_id = $3 AND NOT archived
                     """,
                     str(new_embedding),
                     row["id"],

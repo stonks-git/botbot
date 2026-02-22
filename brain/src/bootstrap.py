@@ -96,14 +96,14 @@ class BootstrapReadiness:
 
     async def _check_first_memory(self, agent_id: str) -> bool:
         count = await self.pool.fetchval(
-            "SELECT COUNT(*) FROM memories WHERE agent_id = $1",
+            "SELECT COUNT(*) FROM memories WHERE agent_id = $1 AND NOT archived",
             agent_id,
         )
         return count > 0
 
     async def _check_first_retrieval(self, agent_id: str) -> bool:
         count = await self.pool.fetchval(
-            "SELECT COUNT(*) FROM memories WHERE agent_id = $1 AND access_count > 0",
+            "SELECT COUNT(*) FROM memories WHERE agent_id = $1 AND NOT archived AND access_count > 0",
             agent_id,
         )
         return count > 0
@@ -120,6 +120,7 @@ class BootstrapReadiness:
             f"""
             SELECT COUNT(*) FROM memories
             WHERE agent_id = $1
+              AND NOT archived
               AND NOT immutable
               AND {WEIGHT_CENTER_SQL} > 0.6
             """,
@@ -139,6 +140,7 @@ class BootstrapReadiness:
             f"""
             SELECT COUNT(*) FROM memories
             WHERE agent_id = $1
+              AND NOT archived
               AND NOT immutable
               AND {WEIGHT_CENTER_SQL} > 0.8
             """,
@@ -148,14 +150,14 @@ class BootstrapReadiness:
 
     async def _check_conflict_resolution(self, agent_id: str) -> bool:
         count = await self.pool.fetchval(
-            "SELECT COUNT(*) FROM memories WHERE agent_id = $1 AND type = 'tension'",
+            "SELECT COUNT(*) FROM memories WHERE agent_id = $1 AND NOT archived AND type = 'tension'",
             agent_id,
         )
         return count > 0
 
     async def _check_creative_association(self, agent_id: str) -> bool:
         count = await self.pool.fetchval(
-            "SELECT COUNT(*) FROM memories WHERE agent_id = $1 AND type = 'narrative'",
+            "SELECT COUNT(*) FROM memories WHERE agent_id = $1 AND NOT archived AND type = 'narrative'",
             agent_id,
         )
         return count > 0
@@ -165,6 +167,7 @@ class BootstrapReadiness:
             """
             SELECT COUNT(*) FROM memories
             WHERE agent_id = $1
+              AND NOT archived
               AND type = 'reflection'
               AND (content ILIKE '%%goal%%' OR content ILIKE '%%achieved%%')
             """,
@@ -177,6 +180,7 @@ class BootstrapReadiness:
             f"""
             SELECT COUNT(*) FROM memories
             WHERE agent_id = $1
+              AND NOT archived
               AND NOT immutable
               AND {WEIGHT_CENTER_SQL} > 0.8
             """,
@@ -186,6 +190,7 @@ class BootstrapReadiness:
             """
             SELECT COUNT(*) FROM memories
             WHERE agent_id = $1
+              AND NOT archived
               AND type = 'reflection'
             """,
             agent_id,

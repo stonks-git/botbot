@@ -56,9 +56,10 @@ See `KB/blueprints/v0.3_current_state.md` for the current blueprint (done phases
 - `DELETE /memory/{id}?agent_id=X` — hard delete
 
 **OpenClaw plugin** (`openclaw/extensions/memory-brain/`):
-- Tools: memory_recall, memory_store, memory_forget (HTTP to brain :8400)
+- Tools: memory_recall, memory_store (conscious store via brainGate, source_tag="agent_deliberate", supports remind_at + protect_until), memory_forget (HTTP to brain :8400)
 - Hook `before_agent_start`: auto-recall → inject via prependContext
-- Hook `agent_end`: auto-capture user + assistant messages with pre-gate chunking (max 10 gate calls/turn)
+- Hook `agent_end`: auto-capture user + assistant messages with pre-gate chunking (max 10 gate calls/turn). **Directive tag stripping (Phase 4):** `stripDirectiveTags()` removes `[[reply_to_current]]`, `[[audio_as_voice]]`, and other `[[...]]` inline directive tags before text reaches `shouldCapture()` and `brainGate()`. Regex: `/\[\[\s*[^\]\n]+\s*\]\]/g`.
+- **BOOTSTRAP.md disabled (Phase 4):** Deleted from workspace, `onboardingCompletedAt` set in workspace-state.json to prevent re-creation. Prevents greeting script ("Hey. I just came online...") from leaking into agent identity memories.
 - Graceful degradation: if brain unreachable, plugin logs warning, OpenClaw works without memory
 
 **Retrieval pipeline**: query → embed(RETRIEVAL_QUERY) → dense CTE (pgvector top 50) + sparse CTE (tsvector top 50) → FULL OUTER JOIN + RRF (k=60) → weighted_score = 0.5*RRF + 0.3*recency(7d halflife) + 0.2*depth_center → FlashRank rerank → final = 0.6*rerank + 0.4*weighted
@@ -110,6 +111,43 @@ DELETE /memory/{memory_id}?agent_id=X
 | `store_correction(trigger, ..., agent_id)` | — | consolidation (P5) |
 | `search_corrections(embedding, agent_id)` | — | consolidation (P5) |
 
+**Archived soft-delete (D-026/D-027, Phase 1 of memory-dedup plan):**
+- `memories.archived BOOLEAN DEFAULT FALSE` — soft-delete flag for dedup losers. All SELECT/UPDATE queries across memory.py, consolidation.py, idle.py, bootstrap.py, context_assembly.py, api.py, db.py include `AND NOT archived`. Exceptions: INSERT (store), DELETE (hard delete), evidence chain queries (archived memories preserved in evidence trails), store_insight weight inheritance (fetches specific source IDs).
+- `memories.archived_reason JSONB` — stores dedup verdict metadata (survivor_id, reason) when a memory is archived.
+- `dedup_verdicts` table — tracks verified dedup pairs to avoid redundant LLM calls. Columns: id (SERIAL PK), agent_id, mem_a_id, mem_b_id, verdict ('redundant'|'distinct'), survivor_id, survivor_label ('A'|'B'|'synthesize', BUG-003 fix), reason, synthesis (TEXT, Session 42 — cached LLM synthesis text for synthesize verdicts), created_at. UNIQUE(agent_id, mem_a_id, mem_b_id). Migration: `004_survivor_label.sql`.
+- Partial index `idx_memories_archived` on `archived WHERE archived = true` (efficient for rare archived memories).
+- Migration file: `brain/migrations/001_archived_and_dedup_verdicts.sql` (idempotent, also applied via schema.sql on startup).
+
+**Scheduled reminders + conscious store (D-029, Phase 5 of memory-dedup plan):**
+- `memories.remind_at TIMESTAMPTZ` — agent-set wake-up time. When due (remind_at <= NOW()), idle loop boosts `importance=1.0` (forced context injection), clears remind_at, enqueues notification.
+- Partial index `idx_memories_remind_at` on `remind_at WHERE remind_at IS NOT NULL AND NOT archived`.
+- Migration file: `brain/migrations/002_remind_at.sql` (idempotent).
+
+**Decay protection (D-031, plan 202602221300):**
+- `memories.protect_until TIMESTAMPTZ` — agent-specified decay protection expiry. While active (protect_until > NOW()), both `_decay_tick` (Tier 1: +0.01 beta/hour) and `get_stale_memories` (Tier 2: deep decay) skip the memory. When expired, idle loop `_check_expired_protections()` runs LLM re-eval with context assembly to decide extend (capped 90d) or release.
+- Partial index `idx_memories_protect_until` on `protect_until WHERE protect_until IS NOT NULL AND NOT archived`.
+- Migration file: `brain/migrations/003_protect_until.sql` (idempotent).
+- Gate API: `GateRequest.protect_until` (ISO 8601 string) → `extra_kw["protect_until"]` → `store_memory($19)`. Chunked: first chunk only.
+- `store_memory()` accepts `remind_at: datetime | None` as 18th param ($18 in INSERT).
+- `GateRequest.remind_at: str | None` — ISO 8601 datetime string, parsed to datetime in gate_memory().
+- **Deliberate weights**: when `source_tag == "agent_deliberate"`, gate passes `initial_alpha=2.0, initial_beta=3.0` to store_memory (Beta center ~0.4 vs default ~0.2). For chunked content, `remind_at` and `protect_until` only set on first chunk.
+
+**Two-stage dedup engine (Phase 2 of memory-dedup plan):**
+- `consolidation.dedup_pair(pool, store, agent_id, mem_a_id, mem_b_id)` — core LLM arbitration. Normalizes pair order (sorted), checks dedup_verdicts cache (including synthesis text), fetches both memories, prompts LLM to judge redundant vs distinct. Prompt (Session 42 fix): explicitly requires synthesis text when choosing "synthesize" — "YOU MUST then write the merged text in the synthesis field." LLM now correctly picks A/B for near-duplicates. Returns verdict dict with `{verdict, survivor_id, loser_id, mem_a_id, mem_b_id, reason, synthesis, survivor}`. Parse failures default to "distinct". LLM failures return None.
+- `MemoryStore.archive_memory(memory_id, agent_id, reason)` — sets `archived=TRUE` + `archived_reason` JSONB. Returns bool (success).
+- `MemoryStore.transfer_weights(from_id, to_id, agent_id)` — transfers both alpha AND beta from source to survivor (preserves Beta distribution shape, doesn't inflate alpha artificially).
+- `MemoryStore.execute_dedup_verdict(agent_id, verdict)` — orchestrates full dedup action: for A/B survivor → transfer weights + archive loser; for "synthesize" with text → create new memory, transfer weights from both originals, archive both. **BUG-003 fallback:** when synthesis requested but text missing (or unknown label), queries both memories for `weight_center`, picks higher as survivor, archives loser with weight transfer. Returns survivor_id.
+- **Gate wiring** (api.py `gate_memory()`): After PERSIST stores a single (non-chunked) memory, if `max_similarity >= DEDUP_SIMILARITY_THRESHOLD` (0.75) and `most_similar_id` exists, triggers `dedup_pair()`. If redundant, executes verdict and updates `memory_id` in GateResponse to reflect survivor. Dedup failure is non-fatal (try/except). Adds `dedup_verdict` and `dedup_survivor` to exit_meta.
+- `gate.py` metadata now includes `most_similar_id` for dedup trigger.
+- `DEDUP_SIMILARITY_THRESHOLD = 0.75` in config.py — the ambiguous zone (0.75–1.0) where LLM verification is needed.
+- **BUG-003 (Session 40-41, FIXED):** Dedup was broken — 10 redundant verdicts, 0 archives executed. Two sub-bugs fixed:
+  - **Bug A (synthesis fallback, Session 41):** Added fallback in `execute_dedup_verdict()`: when synthesis text missing, queries both memories for `weight_center` (via `WEIGHT_CENTER_SQL`), picks higher as survivor, archives loser with weight transfer. Covers both fresh LLM "synthesize" without text and cached "synthesize" verdicts.
+  - **Bug B (cache dict, Session 41):** Added `survivor_label TEXT` column to `dedup_verdicts` (migration 004). `dedup_pair()` cache-hit SELECT now fetches `survivor_label, reason, mem_a_id, mem_b_id, synthesis`. Reconstructs full dict with all keys needed by `execute_dedup_verdict`. Backward-compatible: old NULL rows derive label from `survivor_id` (A=smaller ID, B=larger per pair normalization).
+  - **Bug C (synthesis never cached, Session 42):** Cache path returned `synthesis: None` always — LLM could provide synthesis text but it was lost on re-lookup. Fixed: added `synthesis TEXT` column to `dedup_verdicts`, stored on INSERT, returned from cache SELECT.
+  - **Bug D (prompt too vague, Session 42):** LLM defaulted to "synthesize" 80%+ of the time without providing text. Prompt rewritten with explicit instructions: "YOU MUST then write the merged text" + structured option list. LLM now correctly picks A/B for near-duplicates, reserves synthesize for genuine merges.
+  - **BUG-004 (asyncpg JSONB codec, Session 42):** `_log_consolidation()` DataError — asyncpg doesn't auto-encode dicts for JSONB without registered codecs. Fixed: registered `json`/`jsonb` type codecs on pool init in `db.py`. Removed all manual `json.dumps()` wrappers for JSONB parameters across memory.py, notification.py, idle.py.
+- **Retroactive sweep endpoint** (Session 41): `POST /consolidation/dedup-sweep` — pgvector self-join (`a.embedding <=> b.embedding <= threshold`) finds high-similarity pairs. Runs `dedup_pair` + `execute_dedup_verdict` on each. `dry_run=true` (default) previews without archiving. Request: `{agent_id, similarity_threshold=0.75, dry_run=true, limit=500}`. Response: `{pairs_found, pairs_processed, redundant, archived, distinct, errors}`.
+
 **Config constants** (`brain/src/config.py`):
 - `EMBED_MODEL = "gemini-embedding-001"`, `EMBED_DIMENSIONS = 3072`
 - `RetryConfig(max_retries=3, base_delay=1.0, max_delay=30.0)`
@@ -117,7 +155,10 @@ DELETE /memory/{memory_id}?agent_id=X
 - `NOVELTY_THRESHOLD = 0.85` — shared similarity threshold for novelty/dedup checks (T-B06/CQ-020). Used by gate, memory, consolidation.
 - `WEIGHT_CENTER_SQL = "depth_weight_alpha / (depth_weight_alpha + depth_weight_beta)"` — canonical SQL expression for Beta weight center (T-B06/CQ-013). All SQL queries use this via f-string interpolation.
 - Research constants (D-016): `RESEARCH_HOURLY_LIMIT=1`, `RESEARCH_DAILY_LIMIT=24`, `RESEARCH_MIN_WEIGHT=0.3`, `RESEARCH_DISPLACE_BETA=5.0`, `RESEARCH_CONFIRMATION_HOURS=24`
+- `DEDUP_SIMILARITY_THRESHOLD = 0.75` — ambiguous zone threshold for LLM dedup verification (D-026). Memories with similarity >= 0.75 go to LLM for redundancy check.
 - Notification constants (D-019): `TELEGRAM_BOT_TOKEN_ENV`, `NOTIFICATION_DELIVERY_INTERVAL=30`, `NOTIFICATION_EXPIRY_HOURS=24`, `NOTIFICATION_MAX_PASSIVE_PER_CONTEXT=3`
+- Deliberate memory constants (D-029): `DELIBERATE_INITIAL_ALPHA=2.0`, `DELIBERATE_INITIAL_BETA=3.0`, `DELIBERATE_SOURCE_TAG="agent_deliberate"` — conscious memories stored via agent's `memory_store` tool get higher initial weights (center ~0.4 vs default ~0.2)
+- `PRIORITY_IMPORTANCE_THRESHOLD = 0.95` — memories with importance >= this bypass w×s scoring and get force-injected into [RELEVANT MEMORIES] (D-033). Covers fired reminders (importance=1.0 set by idle loop `_check_due_reminders`). One-shot: importance reset to 0.5 after injection.
 
 **Cross-module dependency graph** (Phase 1 only):
 ```
@@ -164,7 +205,7 @@ api.py          ← memory, db
 **API endpoint** (`POST /memory/gate`):
 ```
 POST /memory/gate
-  Request:  { agent_id, content, source?, source_tag="external_user" }
+  Request:  { agent_id, content, source?, source_tag="external_user", remind_at? }
   Response: { decision, score, memory_id?, scratch_id?, entry_gate: {...}, exit_gate: {...} }
 ```
 Pipeline: entry gate → scratch buffer → exit gate → act on decision:
@@ -216,7 +257,8 @@ api.py          ← memory, gate, db
 
 **Brain modules:**
 - `brain/src/context_assembly.py` — dynamic context injection + identity rendering:
-  - `assemble_context(memory_store, agent_id, ...)` — Track 0 (immutable safety) + active identity (D-015: w×s scored) + Track 1 (situational via `search_hybrid(mutate=False)`). Returns `injected_memory_ids` — IDs of non-immutable memories that survived budget trimming and were actually injected.
+  - `assemble_context(memory_store, agent_id, ...)` — Track 0 (immutable safety) + active identity (D-015: w×s scored) + Track 1 (situational via `search_hybrid(mutate=False)`, excludes already-injected identity IDs). Returns `injected_memory_ids` — IDs of non-immutable memories that survived budget trimming and were actually injected.
+  - **Situational exclusion (Bug 3 fix, Phase 3):** `_get_situational_memories()` accepts `exclude_ids: set[str]` param. `assemble_context` passes `set(injected_memory_ids)` (identity + immutable IDs) so situational results never duplicate identity memories in `[RELEVANT MEMORIES]`.
   - **Active identity (D-015/DJ-005):** Embeds `query_text` with `RETRIEVAL_QUERY` task type, calls `memory_store.score_identity_wxs(query_vec, agent_id)` which computes `injection_score = weight_center × cosine_sim` in SQL via pgvector `<=>`. Memories ranked by injection_score, injected within `BUDGET_IDENTITY_MAX` token budget. No query = no identity injection (relevance is mandatory per DJ-005). Replaces stochastic Beta-sampling. D-018c: chunked memories annotated with `[part N of M]` prefix via `_annotate_chunk()` from metadata `group_part`/`group_total`.
   - **Identity hash (D-017/DJ-006):** Feature-flagged dormant via `IDENTITY_HASH_ENABLED = False`. `render_identity_hash()` skipped during assembly but still callable via API endpoints.
   - **Retrieval mutation** (D-012): after assembly, `api.py` calls `apply_retrieval_mutation(injected_ids)` — increments `access_count` + boosts `depth_weight_alpha` for memories that influenced the agent's output. access_count always increments (factual counter); alpha boost goes through safety check (D-013).
@@ -225,15 +267,17 @@ api.py          ← memory, gate, db
   - `render_identity_hash(memory_store, agent_id)` — compact ~100-200 tokens from top-10 memories by weight center (used by API only when hash dormant)
   - `render_identity_full(memory_store, agent_id)` — full ~1-2k tokens grouped by memory type from top-30 memories (replaces LayerStore.render_identity_full)
   - **Injection logging (D-018d):** After w×s scoring, every candidate is logged to `injection_logs` table with weight_center, cosine_sim, injection_score, was_injected (budget-accepted or not), query_hash (SHA-256[:16] of query_text). Non-blocking (try/except wrapped). Batch INSERT via `pool.executemany()`.
+  - **Priority injection bypass (D-033):** After identity injection + cognitive state, queries `importance >= PRIORITY_IMPORTANCE_THRESHOLD` (0.95) memories that are not already injected. Force-appends to `parts["situational"]` (LIMIT 5), then resets importance to 0.5 (one-shot). Reduces situational budget by priority_tokens to avoid over-budget. Covers fired reminders (importance=1.0 from idle loop). Error-isolated (try/except). Flow: immutable → identity (w×s) → cognitive state → **priority injection** → situational (budget-adjusted).
   - **Adaptive context shift threshold (D-018a, T-P15):** Ring buffer of last 200 context_shift values in `context_shift_buffer` table. Threshold = P75 percentile. Bootstrap default 0.5 when < 200 values. Identity candidates cached per agent (`_identity_cache`), recomputed only when `context_shift >= threshold`. Shift values recorded non-blocking.
   - Context inertia: shift = 1-cosine(current, previous attention). Inertia 5% if shift > adaptive threshold (was hardcoded 0.7), else 30%.
 - `brain/src/memory.py` — `score_identity_wxs(query_vec, agent_id, top_n)` — SQL-native w×s identity scoring. Computes `(alpha/(alpha+beta)) * (1 - (embedding <=> query::halfvec))` in DB. Excludes immutables. Returns candidates ranked by injection_score DESC. Includes `metadata` column for chunk annotation.
+- `brain/src/memory.py` — `get_identity_embeddings(agent_id, top_n=20)` — (D-030/D-032: moved from api.py, threshold removed) top-N memories by weight center, no minimum threshold. Weighted average handles signal integrity — top-20 empirically optimal at 391 memories (discriminative gap 0.036, centroid 99.2% stable vs ALL). Returns `list[(content, center, ndarray)]` or None. Used by gate (via api.py thin wrapper) and idle loop `_feed_gut()` for gut subconscious centroid. Re-evaluate top-N at 1k memories (milestone notification).
 
 **Gate wiring — `_get_identity_embeddings()` in `api.py`:**
-- Queries top-N memories by weight center (`depth_weight_alpha / (depth_weight_alpha + depth_weight_beta) > 0.3`) from DB
-- Uses `embedding::float4[]` SQL cast for asyncpg deserialization → `np.array(..., dtype=np.float32)`
+- Thin wrapper delegating to `MemoryStore.get_identity_embeddings()` (D-030 move)
 - Returns `list[(content, center, ndarray)]` → passed to `ExitGate.evaluate(layer_embeddings=...)`
 - Empty DB (new agents): returns `None` → `has_context=False` → still defaults to "peripheral" as before
+- D-032: no threshold means newborn agents get identity signal from first memory
 - No LayerStore cache needed — query is lightweight (indexed, top-20 only)
 
 **API endpoints** (in `brain/src/api.py`):
@@ -267,8 +311,8 @@ Note: No PUT /identity endpoint — identity changes via memory reinforce/contra
 
 **Brain module** (`brain/src/gut.py`):
 - `GutFeeling` — two-centroid emotional model, D-005 adapted:
-  - **Subconscious centroid**: weighted mean of top-N identity memory embeddings from DB, weighted by Beta weight center (alpha/(alpha+beta)). Reuses `_get_identity_embeddings()` data. Replaces original L0/L1/L2 layer weights.
-  - **Attention centroid**: EMA of recently observed message embeddings. Decay = `exp(-0.693/10) ≈ 0.933` (halflife 10 embeddings). Updated during `/context/assemble` from `query_text`.
+  - **Subconscious centroid**: weighted mean of top-20 identity memory embeddings from DB, weighted by Beta weight center (alpha/(alpha+beta)). No minimum threshold (D-032) — LIMIT 20 selects strongest memories, weighted average handles signal integrity. Reuses `get_identity_embeddings()` data. Replaces original L0/L1/L2 layer weights.
+  - **Attention centroid**: EMA of recently observed message embeddings. Decay = `exp(-0.693/10) ≈ 0.933` (halflife 10 embeddings). Updated during `/context/assemble` from `query_text` AND during DMN heartbeats via `_feed_gut()` (D-030: always-on gut feeding).
   - **GutDelta**: delta = attention - subconscious, magnitude (L2 norm), direction (unit vector)
   - `emotional_charge` = `min(1.0, magnitude / 2.0)` — 0 calm, 1 intense divergence
   - `emotional_alignment` = `max(0.0, 1.0 - magnitude / 2.0)` — 1 aligned, 0 divergent
@@ -342,7 +386,7 @@ api.py               <- memory, gate, context_assembly, gut, db, numpy
 
 - Error isolation: every operation wrapped in individual try/except, one failing agent/operation does not crash the engine
 - Multi-agent: iterates SELECT DISTINCT agent_id FROM memories each cycle
-- All operations log to consolidation_log table. CQ-014 fix: `_log_consolidation()` passes dict directly to asyncpg (not `json.dumps()`). asyncpg's JSONB codec serializes internally; pre-serializing caused double-serialization (details stored as JSON string literals, not objects).
+- All operations log to consolidation_log table. CQ-014 fix: `_log_consolidation()` passes dict directly to asyncpg. BUG-004 (Session 42): registered `json`/`jsonb` type codecs on asyncpg pool init (`db.py init_pool`). All JSONB parameters across the codebase now pass dicts directly — asyncpg's registered codec calls `json.dumps()` automatically. Removed manual `json.dumps()` wrappers from memory.py (store_memory metadata, scratch_buffer metadata, archive_memory reason), notification.py (enqueue metadata), idle.py (3 consolidation_log inserts).
 - Insight linking via memory_supersedes table. D-025: store_insight inherits weighted-avg alpha/beta from sources, no source importance demotion.
 
 BUG-001 (Session 18): gemini-3-flash-preview is a thinking model. Internal chain-of-thought consumes from max_output_tokens budget. With default max_tokens=200, model spent approx 180 on thinking, left approx 20 for output. All consolidation insights were sentence fragments. Fix: remove max_output_tokens cap.
@@ -355,6 +399,10 @@ GET  /consolidation/status
 POST /consolidation/trigger
   Request:  { agent_id }
   Response: { agent_id, triggered, message }
+
+POST /consolidation/dedup-sweep
+  Request:  { agent_id, similarity_threshold=0.75, dry_run=true, limit=500 }
+  Response: { agent_id, pairs_found, pairs_processed, redundant, archived, distinct, errors, dry_run }
 ```
 
 **Plugin update** (`openclaw/extensions/memory-brain/index.ts`):
@@ -410,6 +458,10 @@ api.py               <- memory, gate, context_assembly, gut, consolidation, db, 
   - **Thread lifecycle**: `_start_new_thread()` calls LLM (temperature=0.6), `_continue_thread()` calls LLM (temperature=0.5, checks for "THREAD_RESOLVED")
   - **Repetition filter**: `_is_repetitive()` checks thought[:50] against last 5 topics per agent
   - **Thought persistence** (Session 19): after queueing, `_queue_thought()` INSERTs into `dmn_log` table (non-blocking, try/except wrapped)
+  - **Scheduled reminders** (D-029): `_check_due_reminders()` runs every tick (30s), cross-agent. Queries `WHERE remind_at <= NOW() AND NOT archived LIMIT 10`. For each: sets `importance=1.0` (forced context injection), clears `remind_at`, enqueues notification (urgency=0.8, importance=1.0, source="reminder"), logs to consolidation_log. Error-isolated via `_safe_run_global()`.
+  - **Always-on gut feeding** (D-030): `_feed_gut(agent_id, content)` called from `_heartbeat()` after every branch (random pop, continue thread, new thread). Embeds content[:500] via `SEMANTIC_SIMILARITY`, calls `gut.update_attention()` + `gut.update_subconscious()` (via `memory_store.get_identity_embeddings()`) + `gut.compute_delta()` + `gut.save()`. Exception-safe (try/except → logger.warning). Ensures `emotional_charge > 0` during idle.
+  - **Decay protection re-eval** (D-031): `_check_expired_protections()` runs every tick (30s), cross-agent. Queries `WHERE protect_until <= NOW() AND NOT archived LIMIT 5`. For each: runs `assemble_context(total_budget=20000)` + LLM re-eval. Action: extend (capped 90d) or release (set protect_until=NULL). JSON fence-stripping. Defaults to release on parse failure. Audit trail in consolidation_log (operation='protection_reeval'). Error-isolated via `_safe_run_global()`.
+  - **Memory milestones** (D-032): `_check_memory_milestones()` runs every tick (30s), cross-agent. Checks per-agent memory count against milestones [1000, 5000, 10000]. On crossing: enqueues notification (urgency=0.5, importance=0.8, source="milestone") to re-run gut top-N analysis. Idempotent via consolidation_log check (operation='memory_milestone'). Error-isolated via `_safe_run_global()`.
   - D-005 adaptation: goals from DB query (high-weight narrative/reflection), not LayerStore
 
 **DB table** — `dmn_log` (Session 19):
@@ -472,7 +524,7 @@ stochastic.py        <- standalone
 activation.py        <- numpy
 relevance.py         <- activation
 safety.py            <- standalone (collections, math, logging only)
-db.py                <- asyncpg (pool + get_agent_ids)
+db.py                <- asyncpg (pool + get_agent_ids), json (JSONB codec registration on pool init)
 memory.py            <- config, relevance, db (pool); safety wired at runtime
 gate.py              <- activation, config (NOVELTY_THRESHOLD)
 bootstrap.py         <- config (WEIGHT_CENTER_SQL), asyncpg
@@ -534,7 +586,7 @@ api.py               <- memory, gate, context_assembly, gut, consolidation, idle
 
 **Brain module** (`brain/src/notification.py`):
 - `NotificationStore(pool)` — outbox CRUD:
-  - `enqueue(agent_id, content, urgency, importance, source, ...)` — auto-routes to channel based on preferences. High urgency + telegram_enabled → `channel='telegram'`, otherwise `channel='passive'`.
+  - `enqueue(agent_id, content, urgency, importance, source, ...)` — auto-routes to channel based on preferences. High urgency + telegram_enabled → `channel='telegram'`, otherwise `channel='passive'`. Note: `metadata` param passed as dict directly — asyncpg JSONB codec handles serialization (BUG-004 fix supersedes BUG-002 json.dumps workaround).
   - `get_pending_push(limit)` — pending telegram/webhook notifications (delivery worker polls this)
   - `get_pending_passive(agent_id, limit)` — pending passive notifications for context injection
   - `mark_delivered(id)`, `mark_failed(id, error)`, `expire_old()`

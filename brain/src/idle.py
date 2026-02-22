@@ -82,6 +82,13 @@ class IdleLoop:
 
         while not shutdown_event.is_set():
             try:
+                # D-029: check scheduled reminders (cross-agent, every tick)
+                await self._safe_run_global(self._check_due_reminders)
+                # D-031: check expired decay protections (cross-agent, every tick)
+                await self._safe_run_global(self._check_expired_protections)
+                # D-032: check memory milestones for gut top-N recalibration
+                await self._safe_run_global(self._check_memory_milestones)
+
                 agent_ids = await get_agent_ids(self.pool)
 
                 for agent_id in agent_ids:
@@ -142,6 +149,217 @@ class IdleLoop:
             logger.error("%s failed for %s: %s", coro_fn.__name__, agent_id, e)
             return {"status": "error", "error": str(e)}
 
+    @staticmethod
+    async def _safe_run_global(coro_fn) -> dict:
+        """Run a cross-agent operation with error isolation."""
+        try:
+            return await coro_fn()
+        except Exception as e:
+            logger.error("%s failed: %s", coro_fn.__name__, e)
+            return {"status": "error", "error": str(e)}
+
+    # ── Scheduled reminders (D-029) ──────────────────────────────────
+
+    async def _check_due_reminders(self) -> dict:
+        """Deliver due reminders: boost importance, enqueue notification, clear remind_at."""
+        rows = await self.pool.fetch(
+            """
+            SELECT id, agent_id, content
+            FROM memories
+            WHERE remind_at IS NOT NULL
+              AND remind_at <= NOW()
+              AND NOT archived
+            LIMIT 10
+            """,
+        )
+        if not rows:
+            return {"status": "ok", "delivered": 0}
+
+        import json as _json
+
+        for row in rows:
+            mem_id, agent_id, content = row["id"], row["agent_id"], row["content"]
+
+            # Boost importance to 1.0 — forces context assembly to inject this memory
+            await self.pool.execute(
+                "UPDATE memories SET importance = 1.0, updated_at = NOW() WHERE id = $1 AND agent_id = $2",
+                mem_id, agent_id,
+            )
+            # Clear remind_at to prevent re-delivery
+            await self.pool.execute(
+                "UPDATE memories SET remind_at = NULL WHERE id = $1",
+                mem_id,
+            )
+            # Enqueue notification
+            if self.notification_store:
+                await self.notification_store.enqueue(
+                    agent_id=agent_id,
+                    content=f"Reminder: {content[:300]}",
+                    urgency=0.8,
+                    importance=1.0,
+                    source="reminder",
+                    source_memory_id=mem_id,
+                )
+            # Audit trail
+            await self.pool.execute(
+                """
+                INSERT INTO consolidation_log (agent_id, operation, details)
+                VALUES ($1, 'reminder_delivered', $2::jsonb)
+                """,
+                agent_id,
+                {"memory_id": mem_id},
+            )
+            logger.info("Reminder delivered: memory %s for agent %s", mem_id, agent_id)
+
+        return {"status": "ok", "delivered": len(rows)}
+
+    # ── Decay protection re-evaluation (D-031) ──────────────────────
+
+    async def _check_expired_protections(self) -> dict:
+        """Re-evaluate memories whose protect_until has expired."""
+        rows = await self.pool.fetch(
+            """
+            SELECT id, agent_id, content
+            FROM memories
+            WHERE protect_until IS NOT NULL
+              AND protect_until <= NOW()
+              AND NOT archived
+            LIMIT 5
+            """,
+        )
+        if not rows:
+            return {"status": "ok", "evaluated": 0}
+
+        import json as _json
+        from .context_assembly import assemble_context
+        from .llm import retry_llm_call as _retry_llm
+
+        evaluated = 0
+        for row in rows:
+            mem_id, agent_id, content = row["id"], row["agent_id"], row["content"]
+            try:
+                ctx = await assemble_context(
+                    self.memory_store, agent_id,
+                    query_text=content[:200], total_budget=20000,
+                )
+                identity = "\n".join(ctx["parts"].get("identity_memories", []))
+                situational = "\n".join(ctx["parts"].get("situational", []))
+
+                prompt = (
+                    "You are evaluating whether a protected memory should remain protected from decay.\n\n"
+                    f"[MEMORY]\n{content}\n\n"
+                    f"[IDENTITY CONTEXT]\n{identity[:2000]}\n\n"
+                    f"[SITUATIONAL CONTEXT]\n{situational[:2000]}\n\n"
+                    "Should this memory remain protected? Consider:\n"
+                    "- Is it still relevant to the agent's identity or goals?\n"
+                    "- Would losing it harm the agent's continuity?\n"
+                    "- Is the information still accurate and useful?\n\n"
+                    'Respond ONLY as JSON: {"action": "extend" or "release", '
+                    '"days": <1-90 if extend>, "reason": "one sentence"}'
+                )
+
+                response = await _retry_llm(prompt, temperature=0.2)
+
+                # Parse JSON (handle ```json fences)
+                text = response.strip()
+                if text.startswith("```"):
+                    text = text.split("```")[1]
+                    if text.startswith("json"):
+                        text = text[4:]
+                try:
+                    result = _json.loads(text)
+                except _json.JSONDecodeError:
+                    logger.warning("Protection reeval JSON parse failed for %s: %s", mem_id, text[:200])
+                    result = {"action": "release", "reason": "parse failure"}
+
+                action = result.get("action", "release")
+                reason = result.get("reason", "")
+
+                if action == "extend":
+                    days = min(max(int(result.get("days", 30)), 1), 90)
+                    await self.pool.execute(
+                        "UPDATE memories SET protect_until = NOW() + make_interval(days => $1) WHERE id = $2",
+                        days, mem_id,
+                    )
+                    logger.info("Protection extended %d days for memory %s: %s", days, mem_id, reason)
+                else:
+                    await self.pool.execute(
+                        "UPDATE memories SET protect_until = NULL WHERE id = $1",
+                        mem_id,
+                    )
+                    logger.info("Protection released for memory %s: %s", mem_id, reason)
+
+                # Audit trail
+                await self.pool.execute(
+                    """
+                    INSERT INTO consolidation_log (agent_id, operation, details)
+                    VALUES ($1, 'protection_reeval', $2::jsonb)
+                    """,
+                    agent_id,
+                    {"memory_id": mem_id, "action": action, "reason": reason},
+                )
+                evaluated += 1
+
+            except Exception as e:
+                logger.warning("Protection reeval failed for %s: %s", mem_id, e)
+
+        return {"status": "ok", "evaluated": evaluated}
+
+    # ── Memory milestones (D-032) ───────────────────────────────────
+
+    _MEMORY_MILESTONES = [1000, 5000, 10000]
+
+    async def _check_memory_milestones(self) -> dict:
+        """Enqueue notification when memory count crosses a milestone."""
+        rows = await self.pool.fetch(
+            """
+            SELECT agent_id, COUNT(*) AS cnt
+            FROM memories WHERE NOT archived
+            GROUP BY agent_id
+            """,
+        )
+        if not rows or not self.notification_store:
+            return {"status": "ok", "notified": 0}
+
+        import json as _json
+        notified = 0
+        for row in rows:
+            agent_id, cnt = row["agent_id"], row["cnt"]
+            for milestone in self._MEMORY_MILESTONES:
+                if cnt < milestone:
+                    break
+                # Check if already notified for this milestone
+                already = await self.pool.fetchval(
+                    """
+                    SELECT 1 FROM consolidation_log
+                    WHERE agent_id = $1 AND operation = 'memory_milestone'
+                      AND (details->>'milestone')::int = $2
+                    LIMIT 1
+                    """,
+                    agent_id, milestone,
+                )
+                if already:
+                    continue
+                await self.notification_store.enqueue(
+                    agent_id=agent_id,
+                    content=f"Memory milestone: {cnt} memories reached (milestone: {milestone}). "
+                            f"Re-run gut top-N analysis to verify optimal subconscious centroid N.",
+                    urgency=0.5,
+                    importance=0.8,
+                    source="milestone",
+                )
+                await self.pool.execute(
+                    """
+                    INSERT INTO consolidation_log (agent_id, operation, details)
+                    VALUES ($1, 'memory_milestone', $2::jsonb)
+                    """,
+                    agent_id, {"milestone": milestone, "count": cnt},
+                )
+                logger.info("Memory milestone %d reached for %s (count=%d)", milestone, agent_id, cnt)
+                notified += 1
+
+        return {"status": "ok", "notified": notified}
+
     # ── Rumination management ────────────────────────────────────────
 
     def _get_rumination(self, agent_id: str) -> RuminationManager:
@@ -155,6 +373,7 @@ class IdleLoop:
     async def _heartbeat(self, agent_id: str) -> dict:
         """One DMN heartbeat: continue or start a rumination thread."""
         rm = self._get_rumination(agent_id)
+        sampled_content = None
 
         if rm.has_active_thread():
             thread = rm.active_thread
@@ -165,14 +384,21 @@ class IdleLoop:
                 memory = await self._sample_memory(agent_id)
                 if memory:
                     await self._start_new_thread(agent_id, memory)
+                    sampled_content = memory["content"]
                 rm.save()
             else:
+                sampled_content = rm.active_thread.seed_content
                 await self._continue_thread(agent_id)
         else:
             # No active thread — sample and start
             memory = await self._sample_memory(agent_id)
             if memory:
                 await self._start_new_thread(agent_id, memory)
+                sampled_content = memory["content"]
+
+        # D-030: feed gut attention centroid from heartbeat content
+        if sampled_content:
+            await self._feed_gut(agent_id, sampled_content)
 
         self._heartbeat_count[agent_id] = self._heartbeat_count.get(agent_id, 0) + 1
         return {"status": "ok", "heartbeat": self._heartbeat_count[agent_id]}
@@ -211,6 +437,7 @@ class IdleLoop:
                    {WEIGHT_CENTER_SQL} AS center
             FROM memories
             WHERE agent_id = $1
+              AND NOT archived
               AND embedding IS NOT NULL
               AND NOT immutable
             """,
@@ -241,6 +468,24 @@ class IdleLoop:
         except Exception as e:
             logger.warning("Failed to touch sampled memory %s: %s", memory_id, e)
 
+    async def _feed_gut(self, agent_id: str, content: str) -> None:
+        """Feed gut attention centroid from DMN heartbeat (D-030).
+
+        One embed call per heartbeat keeps emotional_charge non-zero during idle.
+        """
+        try:
+            gut = self._gut_getter(agent_id)
+            embedding = await self.memory_store.embed(
+                content[:500], task_type="SEMANTIC_SIMILARITY",
+            )
+            gut.update_attention(embedding)
+            identity_embs = await self.memory_store.get_identity_embeddings(agent_id)
+            gut.update_subconscious(identity_embs)
+            gut.compute_delta(context=f"dmn:{content[:80]}")
+            gut.save()
+        except Exception as e:
+            logger.warning("Gut feed failed for %s: %s", agent_id, e)
+
     async def _sample_neglected(self, agent_id: str) -> dict | None:
         """High-weight memories not accessed in 7+ days."""
         row = await self.pool.fetchrow(
@@ -248,6 +493,7 @@ class IdleLoop:
             SELECT id, content, type
             FROM memories
             WHERE agent_id = $1
+              AND NOT archived
               AND {WEIGHT_CENTER_SQL} > 0.5
               AND (last_accessed IS NULL OR last_accessed < NOW() - INTERVAL '7 days')
             ORDER BY RANDOM() LIMIT 1
@@ -266,6 +512,7 @@ class IdleLoop:
             SELECT id, content, type, embedding
             FROM memories
             WHERE agent_id = $1
+              AND NOT archived
               AND {WEIGHT_CENTER_SQL} > 0.5
               AND embedding IS NOT NULL
             ORDER BY RANDOM() LIMIT 1
@@ -280,6 +527,7 @@ class IdleLoop:
             SELECT id, content, type
             FROM memories
             WHERE agent_id = $1
+              AND NOT archived
               AND type != $2
               AND embedding IS NOT NULL
               AND 1 - (embedding <=> $3) BETWEEN 0.3 AND 0.7
@@ -315,6 +563,7 @@ class IdleLoop:
             SELECT id, content, type
             FROM memories
             WHERE agent_id = $1
+              AND NOT archived
               AND created_at < NOW() - INTERVAL '30 days'
             ORDER BY RANDOM() LIMIT 1
             """,
@@ -332,6 +581,7 @@ class IdleLoop:
             SELECT id, content, type
             FROM memories
             WHERE agent_id = $1
+              AND NOT archived
               AND type IN ('reflection', 'narrative', 'preference', 'tension')
               AND {WEIGHT_CENTER_SQL} > 0.6
             ORDER BY RANDOM() LIMIT 1
@@ -358,6 +608,7 @@ class IdleLoop:
             f"""
             SELECT content FROM memories
             WHERE agent_id = $1
+              AND NOT archived
               AND type IN ('narrative', 'reflection')
               AND {WEIGHT_CENTER_SQL} > 0.6
             ORDER BY {WEIGHT_CENTER_SQL} DESC

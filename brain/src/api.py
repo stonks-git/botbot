@@ -4,13 +4,16 @@ import asyncio
 import logging
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 
 import numpy as np
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from .config import NOTIFICATION_MAX_PASSIVE_PER_CONTEXT, WEIGHT_CENTER_SQL
-from .consolidation import ConsolidationEngine
+from .config import DEDUP_SIMILARITY_THRESHOLD
+from .config import DELIBERATE_INITIAL_ALPHA, DELIBERATE_INITIAL_BETA, DELIBERATE_SOURCE_TAG
+from .consolidation import ConsolidationEngine, dedup_pair
 from .context_assembly import assemble_context, render_identity_full, render_identity_hash, render_system_prompt
 from .db import close_pool, get_pool, init_pool
 from .dmn_store import ThoughtQueue
@@ -142,33 +145,8 @@ def _store() -> MemoryStore:
 
 
 async def _get_identity_embeddings(agent_id: str, top_n: int = 20):
-    """Top-N memories by weight center — these ARE the agent's identity signal for the gate.
-
-    D-005: Replaces LayerStore.get_all_layer_embeddings(). Identity is the weights.
-    Returns list[(content, center, ndarray)] or None if no memories.
-    """
-    store = _store()
-    rows = await store.pool.fetch(
-        f"""
-        SELECT content,
-               {WEIGHT_CENTER_SQL} AS center,
-               embedding::float4[] AS embedding_arr
-        FROM memories
-        WHERE agent_id = $1 AND embedding IS NOT NULL
-          AND {WEIGHT_CENTER_SQL} > 0.3
-        ORDER BY {WEIGHT_CENTER_SQL} DESC
-        LIMIT $2
-        """,
-        agent_id,
-        top_n,
-    )
-    if not rows:
-        return None
-    result = []
-    for r in rows:
-        emb = np.array(r["embedding_arr"], dtype=np.float32)
-        result.append((r["content"], r["center"], emb))
-    return result or None
+    """Delegate to MemoryStore.get_identity_embeddings (D-030 move)."""
+    return await _store().get_identity_embeddings(agent_id, top_n)
 
 
 # ── Health ─────────────────────────────────────────────────────────────
@@ -178,9 +156,9 @@ async def _get_identity_embeddings(agent_id: str, top_n: int = 20):
 async def health():
     pool = await get_pool()
     async with pool.acquire() as conn:
-        memory_count = await conn.fetchval("SELECT COUNT(*) FROM memories")
+        memory_count = await conn.fetchval("SELECT COUNT(*) FROM memories WHERE NOT archived")
         agent_count = await conn.fetchval(
-            "SELECT COUNT(DISTINCT agent_id) FROM memories"
+            "SELECT COUNT(DISTINCT agent_id) FROM memories WHERE NOT archived"
         )
     return {
         "status": "ok",
@@ -241,6 +219,8 @@ class GateRequest(BaseModel):
     content: str
     source: str | None = None
     source_tag: str = "external_user"
+    remind_at: str | None = None  # ISO 8601 datetime for scheduled reminders
+    protect_until: str | None = None  # ISO 8601 datetime for decay protection (D-031)
 
 
 class GateResponse(BaseModel):
@@ -316,6 +296,24 @@ class ConsolidationTriggerResponse(BaseModel):
     agent_id: str
     triggered: bool
     message: str
+
+
+class DedupSweepRequest(BaseModel):
+    agent_id: str
+    similarity_threshold: float = Field(default=0.75, ge=0.5, le=1.0)
+    dry_run: bool = Field(default=True, description="If true, report pairs but don't execute verdicts")
+    limit: int = Field(default=500, ge=1, le=2000, description="Max pairs to process")
+
+
+class DedupSweepResponse(BaseModel):
+    agent_id: str
+    pairs_found: int
+    pairs_processed: int
+    redundant: int
+    archived: int
+    distinct: int
+    errors: int
+    dry_run: bool
 
 
 class DMNThoughtResponse(BaseModel):
@@ -516,6 +514,17 @@ async def gate_memory(req: GateRequest):
         # Promote to long-term memory (with semantic chunking for long content)
         try:
             importance = min(0.9, 0.5 + score * 0.4)
+
+            # D-029: deliberate memories get higher initial weights
+            extra_kw: dict = {}
+            if req.source_tag == DELIBERATE_SOURCE_TAG:
+                extra_kw["initial_alpha"] = DELIBERATE_INITIAL_ALPHA
+                extra_kw["initial_beta"] = DELIBERATE_INITIAL_BETA
+            if req.remind_at:
+                extra_kw["remind_at"] = datetime.fromisoformat(req.remind_at)
+            if req.protect_until:
+                extra_kw["protect_until"] = datetime.fromisoformat(req.protect_until)
+
             content_tokens = _gate_estimate_tokens(req.content)
 
             if content_tokens > 300:
@@ -531,6 +540,11 @@ async def gate_memory(req: GateRequest):
                         "group_part": idx,
                         "group_total": total,
                     }
+                    # remind_at + protect_until only on first chunk
+                    chunk_extra = {**extra_kw}
+                    if idx > 1:
+                        chunk_extra.pop("remind_at", None)
+                        chunk_extra.pop("protect_until", None)
                     mid = await store.store_memory(
                         content=chunk_text,
                         agent_id=req.agent_id,
@@ -539,6 +553,7 @@ async def gate_memory(req: GateRequest):
                         importance=importance,
                         metadata=chunk_meta,
                         memory_group_id=group_id,
+                        **chunk_extra,
                     )
                     if first_id is None:
                         first_id = mid
@@ -556,6 +571,7 @@ async def gate_memory(req: GateRequest):
                     source_tag=req.source_tag,
                     importance=importance,
                     metadata={"gate_decision": decision, "gate_score": score},
+                    **extra_kw,
                 )
             # Remove from scratch
             await store.pool.execute(
@@ -566,6 +582,36 @@ async def gate_memory(req: GateRequest):
         except RuntimeError as e:
             logger.error("Failed to persist gated memory: %s", e)
             decision = BUFFER  # Fall back to scratch
+
+        # Triggered dedup: only for non-chunked single memories with high similarity
+        if (
+            memory_id is not None
+            and content_tokens <= 300  # skip chunked memories
+            and exit_meta.get("max_similarity", 0) >= DEDUP_SIMILARITY_THRESHOLD
+            and exit_meta.get("most_similar_id")
+            and exit_meta.get("most_similar_id") != memory_id
+        ):
+            try:
+                verdict = await dedup_pair(
+                    store.pool, store, req.agent_id,
+                    memory_id, exit_meta["most_similar_id"],
+                )
+                if verdict and verdict["verdict"] == "redundant":
+                    survivor_id = await store.execute_dedup_verdict(
+                        req.agent_id, verdict,
+                    )
+                    if survivor_id and survivor_id != memory_id:
+                        memory_id = survivor_id
+                    exit_meta["dedup_verdict"] = verdict["verdict"]
+                    exit_meta["dedup_survivor"] = survivor_id
+                    logger.info(
+                        "Dedup at gate: verdict=%s, survivor=%s [%s]",
+                        verdict["verdict"], survivor_id, req.agent_id,
+                    )
+                elif verdict:
+                    exit_meta["dedup_verdict"] = verdict["verdict"]
+            except Exception:
+                logger.warning("Dedup failed at gate (non-fatal) [%s]", req.agent_id, exc_info=True)
 
     elif decision == REINFORCE:
         # Find most similar memory and reinforce it
@@ -786,6 +832,88 @@ async def consolidation_trigger(req: ConsolidationTriggerRequest):
     )
 
 
+@app.post("/consolidation/dedup-sweep", response_model=DedupSweepResponse)
+async def consolidation_dedup_sweep(req: DedupSweepRequest):
+    """Retroactive batch dedup sweep: find high-similarity pairs via pgvector,
+    run LLM arbitration on each, execute verdicts.
+
+    Use dry_run=true (default) to preview without archiving.
+    """
+    store = _store()
+    pool = store.pool
+
+    # Find high-similarity pairs using pgvector cosine distance self-join.
+    # (1 - cosine_distance) >= threshold  →  cosine_distance <= (1 - threshold)
+    max_distance = 1.0 - req.similarity_threshold
+    pairs = await pool.fetch(
+        """
+        SELECT a.id AS id_a, b.id AS id_b,
+               1 - (a.embedding <=> b.embedding) AS sim
+        FROM memories a
+        JOIN memories b ON a.id < b.id
+            AND a.agent_id = b.agent_id
+            AND (a.embedding <=> b.embedding) <= $2
+        WHERE a.agent_id = $1
+          AND NOT a.archived AND NOT b.archived
+          AND a.embedding IS NOT NULL AND b.embedding IS NOT NULL
+        ORDER BY (a.embedding <=> b.embedding) ASC
+        LIMIT $3
+        """,
+        req.agent_id,
+        max_distance,
+        req.limit,
+    )
+
+    pairs_found = len(pairs)
+    redundant = 0
+    archived = 0
+    distinct = 0
+    errors = 0
+
+    for pair in pairs:
+        try:
+            verdict = await dedup_pair(
+                pool, store, req.agent_id,
+                pair["id_a"], pair["id_b"],
+            )
+            if verdict is None:
+                errors += 1
+                continue
+            if verdict["verdict"] == "redundant":
+                redundant += 1
+                if not req.dry_run:
+                    survivor_id = await store.execute_dedup_verdict(
+                        req.agent_id, verdict,
+                    )
+                    if survivor_id:
+                        archived += 1
+            else:
+                distinct += 1
+        except Exception:
+            logger.warning(
+                "Dedup sweep error for pair (%s, %s) [%s]",
+                pair["id_a"], pair["id_b"], req.agent_id,
+                exc_info=True,
+            )
+            errors += 1
+
+    logger.info(
+        "Dedup sweep complete [%s]: %d pairs, %d redundant, %d archived, %d distinct, %d errors (dry_run=%s)",
+        req.agent_id, pairs_found, redundant, archived, distinct, errors, req.dry_run,
+    )
+
+    return DedupSweepResponse(
+        agent_id=req.agent_id,
+        pairs_found=pairs_found,
+        pairs_processed=pairs_found - errors,
+        redundant=redundant,
+        archived=archived,
+        distinct=distinct,
+        errors=errors,
+        dry_run=req.dry_run,
+    )
+
+
 # ── DMN / Idle Loop ──────────────────────────────────────────────────
 
 
@@ -882,6 +1010,7 @@ async def monologue(agent_id: str, limit: int = Query(default=50, ge=1, le=200))
             SELECT id, content, type, created_at
             FROM memories
             WHERE agent_id = $1
+              AND NOT archived
               AND type IN ('tension', 'narrative', 'reflection')
               AND source = 'consolidation'
             ORDER BY created_at DESC LIMIT $2

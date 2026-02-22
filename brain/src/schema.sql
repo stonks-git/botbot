@@ -30,6 +30,10 @@ CREATE TABLE IF NOT EXISTS memories (
     -- Safety / immutability
     immutable       BOOLEAN     DEFAULT FALSE,
 
+    -- Soft delete for dedup (D-026)
+    archived        BOOLEAN     DEFAULT FALSE,
+    archived_reason JSONB,
+
     -- Compressed summary (re-generated during consolidation)
     compressed      TEXT,
 
@@ -56,7 +60,13 @@ CREATE TABLE IF NOT EXISTS memories (
     utility_score   FLOAT       DEFAULT 0.0,
 
     -- Memory group linking (D-018c): chunks from semantic chunking share group_id
-    memory_group_id TEXT
+    memory_group_id TEXT,
+
+    -- Scheduled reminder (D-029): agent-set wake-up time
+    remind_at       TIMESTAMPTZ,
+
+    -- Decay protection (D-031): agent-set protection expiry
+    protect_until   TIMESTAMPTZ
 );
 
 -- Vector similarity search (HNSW for approximate nearest neighbor)
@@ -96,6 +106,41 @@ END $$;
 
 CREATE INDEX IF NOT EXISTS idx_memories_group
     ON memories (memory_group_id) WHERE memory_group_id IS NOT NULL;
+
+-- Scheduled reminder lookup (D-029): partial index for due reminder queries
+CREATE INDEX IF NOT EXISTS idx_memories_remind_at
+    ON memories (remind_at) WHERE remind_at IS NOT NULL AND NOT archived;
+
+-- Decay protection expiry lookup (D-031): partial index for protected memory queries
+CREATE INDEX IF NOT EXISTS idx_memories_protect_until
+    ON memories (protect_until) WHERE protect_until IS NOT NULL AND NOT archived;
+
+-- Archived soft-delete filter (D-026): partial index on archived=true only
+CREATE INDEX IF NOT EXISTS idx_memories_archived
+    ON memories (archived) WHERE archived = true;
+
+
+-- =============================================================================
+-- DEDUP VERDICTS — Tracks already-verified dedup pairs to avoid repeat LLM calls (D-026)
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS dedup_verdicts (
+    id              SERIAL      PRIMARY KEY,
+    agent_id        TEXT        NOT NULL,
+    mem_a_id        TEXT        NOT NULL,
+    mem_b_id        TEXT        NOT NULL,
+    verdict         TEXT        NOT NULL,  -- 'redundant' | 'distinct'
+    survivor_id     TEXT,
+    survivor_label  TEXT,       -- 'A' | 'B' | 'synthesize' (BUG-003 fix)
+    reason          TEXT,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (agent_id, mem_a_id, mem_b_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_dedup_verdicts_agent
+    ON dedup_verdicts (agent_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_dedup_verdicts_pair
+    ON dedup_verdicts (agent_id, mem_a_id);
 
 
 -- =============================================================================
@@ -299,5 +344,33 @@ CREATE INDEX IF NOT EXISTS idx_research_queue_status
 -- 0 = regular memory, 1 = insight, 2 = meta-insight (excluded from future clustering)
 DO $$ BEGIN
     ALTER TABLE memories ADD COLUMN insight_level INT DEFAULT 0;
+EXCEPTION WHEN duplicate_column THEN NULL;
+END $$;
+
+-- D-026: archived soft-delete for dedup
+DO $$ BEGIN
+    ALTER TABLE memories ADD COLUMN archived BOOLEAN DEFAULT FALSE;
+EXCEPTION WHEN duplicate_column THEN NULL;
+END $$;
+DO $$ BEGIN
+    ALTER TABLE memories ADD COLUMN archived_reason JSONB;
+EXCEPTION WHEN duplicate_column THEN NULL;
+END $$;
+
+-- D-029: remind_at column for scheduled reminders
+DO $$ BEGIN
+    ALTER TABLE memories ADD COLUMN remind_at TIMESTAMPTZ;
+EXCEPTION WHEN duplicate_column THEN NULL;
+END $$;
+
+-- D-031: protect_until column for decay protection
+DO $$ BEGIN
+    ALTER TABLE memories ADD COLUMN protect_until TIMESTAMPTZ;
+EXCEPTION WHEN duplicate_column THEN NULL;
+END $$;
+
+-- BUG-003: survivor_label column for dedup cache reconstruction
+DO $$ BEGIN
+    ALTER TABLE dedup_verdicts ADD COLUMN survivor_label TEXT;
 EXCEPTION WHEN duplicate_column THEN NULL;
 END $$;

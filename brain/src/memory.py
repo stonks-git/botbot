@@ -1,12 +1,13 @@
 """Memory store — embed, store, retrieve, mutate memories with Beta-distributed weights."""
 
 import asyncio
-import json
 import logging
 import os
 import uuid
 from datetime import datetime, timezone
 from typing import Any
+
+import numpy as np
 
 import asyncpg
 from google import genai
@@ -142,6 +143,8 @@ class MemoryStore:
         initial_alpha: float | None = None,
         initial_beta: float | None = None,
         memory_group_id: str | None = None,
+        remind_at: "datetime | None" = None,
+        protect_until: "datetime | None" = None,
     ) -> str:
         mem_id = self._gen_id()
         prefixed = self.prefixed_content(content, memory_type)
@@ -153,11 +156,13 @@ class MemoryStore:
             INSERT INTO memories (
                 id, agent_id, content, type, embedding, created_at, updated_at,
                 source, tags, confidence, importance, evidence_count, metadata, source_tag,
-                depth_weight_alpha, depth_weight_beta, memory_group_id
+                depth_weight_alpha, depth_weight_beta, memory_group_id, remind_at,
+                protect_until
             ) VALUES (
                 $1, $2, $3, $4, $5::halfvec, $6, $7,
                 $8, $9, $10, $11, $12, $13, $14,
-                $15, $16, $17
+                $15, $16, $17, $18,
+                $19
             )
             """,
             mem_id,
@@ -172,11 +177,13 @@ class MemoryStore:
             confidence,
             importance,
             evidence_count,
-            json.dumps(metadata or {}),
+            metadata or {},
             source_tag or "external_user",
             initial_alpha if initial_alpha is not None else 1.0,
             initial_beta if initial_beta is not None else 4.0,
             memory_group_id,
+            remind_at,
+            protect_until,
         )
         logger.info("Stored memory %s (type=%s, agent=%s, group=%s)", mem_id, memory_type, agent_id, memory_group_id)
         return mem_id
@@ -271,7 +278,7 @@ class MemoryStore:
 
     async def get_memory(self, memory_id: str, agent_id: str) -> dict | None:
         row = await self.pool.fetchrow(
-            "SELECT * FROM memories WHERE id = $1 AND agent_id = $2",
+            "SELECT * FROM memories WHERE id = $1 AND agent_id = $2 AND NOT archived",
             memory_id,
             agent_id,
         )
@@ -279,14 +286,14 @@ class MemoryStore:
 
     async def get_random_memory(self, agent_id: str) -> dict | None:
         row = await self.pool.fetchrow(
-            "SELECT * FROM memories WHERE agent_id = $1 ORDER BY RANDOM() LIMIT 1",
+            "SELECT * FROM memories WHERE agent_id = $1 AND NOT archived ORDER BY RANDOM() LIMIT 1",
             agent_id,
         )
         return dict(row) if row else None
 
     async def memory_count(self, agent_id: str) -> int:
         return await self.pool.fetchval(
-            "SELECT COUNT(*) FROM memories WHERE agent_id = $1",
+            "SELECT COUNT(*) FROM memories WHERE agent_id = $1 AND NOT archived",
             agent_id,
         )
 
@@ -354,7 +361,8 @@ class MemoryStore:
                    last_accessed, tags, source, created_at,
                    1 - (embedding <=> $1::halfvec) AS similarity
             FROM memories
-            WHERE agent_id = $2 AND 1 - (embedding <=> $1::halfvec) > $3
+            WHERE agent_id = $2 AND NOT archived
+              AND 1 - (embedding <=> $1::halfvec) > $3
             ORDER BY embedding <=> $1::halfvec
             LIMIT $4
             """,
@@ -384,7 +392,7 @@ class MemoryStore:
                        depth_weight_alpha, depth_weight_beta,
                        ROW_NUMBER() OVER (ORDER BY embedding <=> $1::halfvec) AS dense_rank
                 FROM memories
-                WHERE agent_id = $2
+                WHERE agent_id = $2 AND NOT archived
                 ORDER BY embedding <=> $1::halfvec
                 LIMIT 50
             ),
@@ -392,7 +400,7 @@ class MemoryStore:
                 SELECT id,
                        ROW_NUMBER() OVER (ORDER BY ts_rank_cd(content_tsv, query) DESC) AS sparse_rank
                 FROM memories, websearch_to_tsquery('english', $3) query
-                WHERE agent_id = $2 AND content_tsv @@ query
+                WHERE agent_id = $2 AND NOT archived AND content_tsv @@ query
                 ORDER BY ts_rank_cd(content_tsv, query) DESC
                 LIMIT 50
             ),
@@ -505,6 +513,7 @@ class MemoryStore:
                      * (1 - (embedding <=> $1::halfvec)) AS injection_score
             FROM memories
             WHERE agent_id = $2
+              AND NOT archived
               AND embedding IS NOT NULL
               AND immutable = false
             ORDER BY injection_score DESC
@@ -515,6 +524,35 @@ class MemoryStore:
             top_n,
         )
         return [dict(r) for r in rows]
+
+    async def get_identity_embeddings(
+        self, agent_id: str, top_n: int = 20,
+    ) -> list[tuple] | None:
+        """Top-N memories by weight center — identity signal for gate & gut.
+
+        D-005/D-030/D-032: No threshold — weighted average handles signal.
+        Returns list[(content, center, ndarray)] or None.
+        """
+        rows = await self.pool.fetch(
+            f"""
+            SELECT content,
+                   {WEIGHT_CENTER_SQL} AS center,
+                   embedding::float4[] AS embedding_arr
+            FROM memories
+            WHERE agent_id = $1 AND NOT archived AND embedding IS NOT NULL
+            ORDER BY {WEIGHT_CENTER_SQL} DESC
+            LIMIT $2
+            """,
+            agent_id,
+            top_n,
+        )
+        if not rows:
+            return None
+        result = []
+        for r in rows:
+            emb = np.array(r["embedding_arr"], dtype=np.float32)
+            result.append((r["content"], r["center"], emb))
+        return result or None
 
     # ── Mutation ───────────────────────────────────────────────────────
 
@@ -541,7 +579,7 @@ class MemoryStore:
                     COALESCE(access_timestamps, ARRAY[]::timestamptz[]), $1
                 ),
                 updated_at = $1
-            WHERE id = ANY($2) AND agent_id = $3 AND NOT immutable
+            WHERE id = ANY($2) AND agent_id = $3 AND NOT immutable AND NOT archived
             """,
             now,
             retrieved_ids,
@@ -556,7 +594,7 @@ class MemoryStore:
                 """
                 SELECT id, access_count, depth_weight_alpha, depth_weight_beta
                 FROM memories
-                WHERE id = ANY($1) AND agent_id = $2 AND NOT immutable
+                WHERE id = ANY($1) AND agent_id = $2 AND NOT immutable AND NOT archived
                 """,
                 retrieved_ids,
                 agent_id,
@@ -587,7 +625,7 @@ class MemoryStore:
                     UPDATE memories
                     SET depth_weight_alpha = depth_weight_alpha + $2,
                         updated_at = $1
-                    WHERE id = $3 AND agent_id = $4 AND NOT immutable
+                    WHERE id = $3 AND agent_id = $4 AND NOT immutable AND NOT archived
                     """,
                     now,
                     gain,
@@ -601,7 +639,7 @@ class MemoryStore:
                 UPDATE memories
                 SET depth_weight_alpha = depth_weight_alpha + 0.1,
                     updated_at = $1
-                WHERE id = ANY($2) AND agent_id = $3 AND NOT immutable
+                WHERE id = ANY($2) AND agent_id = $3 AND NOT immutable AND NOT archived
                 """,
                 now,
                 retrieved_ids,
@@ -615,7 +653,7 @@ class MemoryStore:
                 UPDATE memories
                 SET depth_weight_beta = depth_weight_beta + 0.05,
                     updated_at = $1
-                WHERE id = ANY($2) AND agent_id = $3 AND NOT immutable
+                WHERE id = ANY($2) AND agent_id = $3 AND NOT immutable AND NOT archived
                 """,
                 now,
                 near_miss_ids,
@@ -637,7 +675,7 @@ class MemoryStore:
 
         # Check if memory belongs to a group
         group_id = await self.pool.fetchval(
-            "SELECT memory_group_id FROM memories WHERE id = $1 AND agent_id = $2",
+            "SELECT memory_group_id FROM memories WHERE id = $1 AND agent_id = $2 AND NOT archived",
             memory_id,
             agent_id,
         )
@@ -648,7 +686,7 @@ class MemoryStore:
                 """
                 UPDATE memories
                 SET last_accessed = $1, updated_at = $1
-                WHERE memory_group_id = $2 AND agent_id = $3 AND NOT immutable
+                WHERE memory_group_id = $2 AND agent_id = $3 AND NOT immutable AND NOT archived
                 """,
                 now,
                 group_id,
@@ -660,7 +698,7 @@ class MemoryStore:
                 """
                 UPDATE memories
                 SET last_accessed = $1, updated_at = $1
-                WHERE id = $2 AND agent_id = $3 AND NOT immutable
+                WHERE id = $2 AND agent_id = $3 AND NOT immutable AND NOT archived
                 """,
                 now,
                 memory_id,
@@ -688,7 +726,7 @@ class MemoryStore:
             content,
             source,
             tags or [],
-            json.dumps(metadata or {}),
+            metadata or {},
         )
         return scratch_id
 
@@ -719,7 +757,7 @@ class MemoryStore:
             """
             SELECT id, 1 - (embedding <=> $1::halfvec) AS similarity
             FROM memories
-            WHERE agent_id = $2
+            WHERE agent_id = $2 AND NOT archived
             ORDER BY embedding <=> $1::halfvec
             LIMIT 1
             """,
@@ -743,9 +781,11 @@ class MemoryStore:
                    depth_weight_alpha, depth_weight_beta
             FROM memories
             WHERE agent_id = $1
+              AND NOT archived
               AND (last_accessed IS NULL OR last_accessed < NOW() - INTERVAL '1 day' * $2)
               AND access_count < $3
               AND importance > 0.05
+              AND (protect_until IS NULL OR protect_until < NOW())
             ORDER BY importance ASC
             """,
             agent_id,
@@ -761,7 +801,7 @@ class MemoryStore:
         factor: float = 0.5,
     ) -> None:
         await self.pool.execute(
-            "UPDATE memories SET importance = importance * $1 WHERE id = ANY($2) AND agent_id = $3",
+            "UPDATE memories SET importance = importance * $1 WHERE id = ANY($2) AND agent_id = $3 AND NOT archived",
             factor,
             memory_ids,
             agent_id,
@@ -773,7 +813,7 @@ class MemoryStore:
     ) -> float:
         query = f"""
             SELECT AVG({WEIGHT_CENTER_SQL})
-            FROM memories WHERE agent_id = $1
+            FROM memories WHERE agent_id = $1 AND NOT archived
         """
         result = await self.pool.fetchval(query, agent_id)
         return float(result) if result else 0.0
@@ -791,7 +831,7 @@ class MemoryStore:
             SELECT id, content, confidence, metadata, created_at,
                    1 - (embedding <=> $1::halfvec) AS similarity
             FROM memories
-            WHERE agent_id = $2 AND type = 'correction'
+            WHERE agent_id = $2 AND NOT archived AND type = 'correction'
             ORDER BY embedding <=> $1::halfvec
             LIMIT $3
             """,
@@ -821,3 +861,120 @@ class MemoryStore:
             confidence=confidence,
             metadata=metadata,
         )
+
+    # ── Dedup helpers ──────────────────────────────────────────────────
+
+    async def archive_memory(self, memory_id: str, agent_id: str, reason: dict) -> bool:
+        """Soft-delete a memory by setting archived=True with a reason."""
+        result = await self.pool.execute(
+            """
+            UPDATE memories
+            SET archived = TRUE, archived_reason = $3::jsonb, updated_at = NOW()
+            WHERE id = $1 AND agent_id = $2 AND NOT archived
+            """,
+            memory_id,
+            agent_id,
+            reason,
+        )
+        return result == "UPDATE 1"
+
+    async def transfer_weights(self, from_id: str, to_id: str, agent_id: str) -> None:
+        """Transfer alpha+beta from one memory to another (preserves distribution shape)."""
+        from_mem = await self.pool.fetchrow(
+            "SELECT depth_weight_alpha, depth_weight_beta FROM memories WHERE id = $1 AND agent_id = $2",
+            from_id,
+            agent_id,
+        )
+        if not from_mem:
+            return
+        await self.pool.execute(
+            """
+            UPDATE memories
+            SET depth_weight_alpha = depth_weight_alpha + $2,
+                depth_weight_beta = depth_weight_beta + $3,
+                updated_at = NOW()
+            WHERE id = $1 AND agent_id = $4 AND NOT archived
+            """,
+            to_id,
+            from_mem["depth_weight_alpha"],
+            from_mem["depth_weight_beta"],
+            agent_id,
+        )
+
+    async def execute_dedup_verdict(self, agent_id: str, verdict: dict) -> str | None:
+        """Execute a dedup verdict: archive loser, transfer weights, handle synthesis.
+
+        Returns survivor_id or None if verdict was 'distinct'.
+        BUG-003 fix: when synthesis requested but text missing, falls back to
+        picking the memory with higher weight_center as survivor.
+        """
+        if verdict.get("verdict") != "redundant":
+            return None
+
+        survivor_label = verdict.get("survivor")
+
+        if survivor_label in ("A", "B"):
+            # Simple case: one survivor, one loser
+            survivor_id = verdict["survivor_id"]
+            loser_id = verdict["loser_id"]
+            await self.transfer_weights(loser_id, survivor_id, agent_id)
+            await self.archive_memory(loser_id, agent_id, {
+                "dedup": True,
+                "survivor_id": survivor_id,
+                "reason": verdict.get("reason", ""),
+            })
+            return survivor_id
+
+        if survivor_label == "synthesize" and verdict.get("synthesis"):
+            # Synthesis: create new memory, transfer weights from both, archive both
+            new_id = await self.store_memory(
+                content=verdict["synthesis"],
+                agent_id=agent_id,
+                source="dedup_synthesis",
+                source_tag="consolidation",
+            )
+            orig_a = verdict["mem_a_id"]
+            orig_b = verdict["mem_b_id"]
+            await self.transfer_weights(orig_a, new_id, agent_id)
+            await self.transfer_weights(orig_b, new_id, agent_id)
+            for orig_id in (orig_a, orig_b):
+                await self.archive_memory(orig_id, agent_id, {
+                    "dedup": True,
+                    "survivor_id": new_id,
+                    "reason": "synthesized replacement",
+                })
+            return new_id
+
+        # BUG-003 fallback: synthesis requested but no text (or unknown label).
+        # Pick the memory with higher weight_center as survivor.
+        mem_a_id = verdict.get("mem_a_id")
+        mem_b_id = verdict.get("mem_b_id")
+        if mem_a_id and mem_b_id:
+            rows = await self.pool.fetch(
+                f"""
+                SELECT id, {WEIGHT_CENTER_SQL} AS center
+                FROM memories
+                WHERE id = ANY($1) AND agent_id = $2 AND NOT archived
+                """,
+                [mem_a_id, mem_b_id],
+                agent_id,
+            )
+            if len(rows) == 2:
+                centers = {r["id"]: r["center"] for r in rows}
+                if centers.get(mem_a_id, 0) >= centers.get(mem_b_id, 0):
+                    survivor_id, loser_id = mem_a_id, mem_b_id
+                else:
+                    survivor_id, loser_id = mem_b_id, mem_a_id
+                await self.transfer_weights(loser_id, survivor_id, agent_id)
+                await self.archive_memory(loser_id, agent_id, {
+                    "dedup": True,
+                    "survivor_id": survivor_id,
+                    "reason": verdict.get("reason", "") + " (synthesis fallback: higher weight)",
+                })
+                logger.info(
+                    "Dedup synthesis fallback: %s survives over %s [%s]",
+                    survivor_id, loser_id, agent_id,
+                )
+                return survivor_id
+
+        return None
